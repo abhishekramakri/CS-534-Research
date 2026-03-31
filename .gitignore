@@ -9,8 +9,6 @@ __pycache__/
 # Data files (too large for git)
 *.sens
 *.ply
-*.wav
-audio/
 
 # Jupyter
 .ipynb_checkpoints/
