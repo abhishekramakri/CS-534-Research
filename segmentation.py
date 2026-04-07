@@ -53,19 +53,34 @@ FALLBACK_MATERIALS = {
 # -----------------------------------------------------------------------
 # SegFormer inference
 # -----------------------------------------------------------------------
+
+# Module-level cache so the model is only loaded once per process.
+_segformer_cache: dict = {}
+
+
+def _get_segformer(device: str):
+    """Load (or return cached) SegFormer processor + model on the given device."""
+    if _segformer_cache.get("device") != device:
+        from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+        model_id = "nvidia/segformer-b0-finetuned-ade-512-512"
+        processor = SegformerImageProcessor.from_pretrained(model_id)
+        model = SegformerForSemanticSegmentation.from_pretrained(model_id)
+        model.to(device).eval()
+        _segformer_cache["processor"] = processor
+        _segformer_cache["model"] = model
+        _segformer_cache["device"] = device
+    return _segformer_cache["processor"], _segformer_cache["model"]
+
+
 def _run_segformer(img_array: np.ndarray, device: str):
     """
     Run SegFormer-b0 (ADE20K) on an HxWx3 uint8 array.
-    Returns (seg_map [H,W], class_probs [150,H,W]).
+    Returns seg_map [H,W].
     """
-    from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
     import torch
     import torch.nn.functional as F
 
-    model_id = "nvidia/segformer-b0-finetuned-ade-512-512"
-    processor = SegformerImageProcessor.from_pretrained(model_id)
-    model = SegformerForSemanticSegmentation.from_pretrained(model_id)
-    model.to(device).eval()
+    processor, model = _get_segformer(device)
 
     pil_img = Image.fromarray(img_array)
     inputs = processor(images=pil_img, return_tensors="pt")
@@ -212,7 +227,12 @@ def classify_materials(
     if method == "segformer":
         import torch
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         seg_map = _run_segformer(img, device)
         best, dists = _distributions_from_segmap(seg_map)
     else:
