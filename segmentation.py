@@ -22,14 +22,14 @@ from PIL import Image
 # -----------------------------------------------------------------------
 ADE20K_TO_MATERIAL = {
     # floor surfaces
-    3:  ("floor",   "parquet_wood_22mm"),      # "floor, flooring"
+    3:  ("floor",   "wood_16mm"),              # "floor, flooring"
     28: ("floor",   "carpet_cotton"),           # "rug, carpet, carpeting"
 
     # wall surfaces
     0:  ("walls",   "plasterboard"),            # "wall"
-    8:  ("walls",   "plasterboard"),            # "windowpane" — glass-like, low absorption
-    14: ("walls",   "wood_panel"),              # "door"
-    18: ("walls",   "carpet_cotton"),           # "curtain" — high absorption, approximate
+    8:  ("walls",   "glass_window"),            # "windowpane"
+    14: ("walls",   "wooden_door"),             # "door"
+    18: ("walls",   "curtains_densely_woven"),  # "curtain" — high absorption
 
     # ceiling surfaces
     5:  ("ceiling", "ceiling_fibre_absorber"),  # "ceiling"
@@ -45,7 +45,7 @@ SURFACE_CLASS_IDS = {
 # Used when segmentation finds nothing or no model is available
 FALLBACK_MATERIALS = {
     "walls":   "plasterboard",
-    "floor":   "parquet_wood_22mm",
+    "floor":   "wood_16mm",
     "ceiling": "ceiling_fibre_absorber",
 }
 
@@ -72,25 +72,39 @@ def _get_segformer(device: str):
     return _segformer_cache["processor"], _segformer_cache["model"]
 
 
-def _run_segformer(img_array: np.ndarray, device: str):
+def _run_segformer(img_array: np.ndarray, device: str, max_dim: int = 512):
     """
     Run SegFormer-b0 (ADE20K) on an HxWx3 uint8 array.
-    Returns seg_map [H,W].
+    Returns seg_map [H,W] (at original resolution).
+
+    The image is downscaled to max_dim before inference (SegFormer-b0 was
+    trained at 512x512).  The segmentation map is upsampled back to the
+    original size.  This is significantly faster for high-res inputs.
     """
     import torch
     import torch.nn.functional as F
 
     processor, model = _get_segformer(device)
 
-    pil_img = Image.fromarray(img_array)
+    H_orig, W_orig = img_array.shape[:2]
+
+    # Downscale to max_dim on the longest side (matches training resolution)
+    scale = min(max_dim / H_orig, max_dim / W_orig, 1.0)
+    if scale < 1.0:
+        H_new, W_new = int(H_orig * scale), int(W_orig * scale)
+        pil_img = Image.fromarray(img_array).resize((W_new, H_new), Image.BILINEAR)
+    else:
+        pil_img = Image.fromarray(img_array)
+
     inputs = processor(images=pil_img, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
         logits = model(**inputs).logits                       # (1, 150, H/4, W/4)
 
+    # Upsample back to original resolution for pixel-accurate surface areas
     upsampled = F.interpolate(
-        logits, size=img_array.shape[:2], mode="bilinear", align_corners=False
+        logits, size=(H_orig, W_orig), mode="bilinear", align_corners=False
     )
     seg_map = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()   # (H, W)
     return seg_map
@@ -161,9 +175,9 @@ def _heuristic_classify(img_array: np.ndarray,
     fb = _brightness(floor_region)
     fw = _warmth(floor_region)
     if fb < 0.3:
-        floor_mat = "parquet_wood_22mm"     # dark → wood
+        floor_mat = "wood_16mm"     # dark → wood
     elif fw > 0.05 and fb < 0.6:
-        floor_mat = "parquet_wood_22mm"     # warm mid-tone → wood
+        floor_mat = "wood_16mm"     # warm mid-tone → wood
     elif fb > 0.7:
         floor_mat = "marble_floor"          # very bright → marble/tile
     else:
@@ -210,7 +224,7 @@ def classify_materials(
             "ceiling":        str,
             "distributions":  {      # per-surface confidence fractions
                 "walls":   {"plasterboard": 0.85, "wood_panel": 0.15},
-                "floor":   {"parquet_wood_22mm": 0.6, "carpet_cotton": 0.4},
+                "floor":   {"wood_16mm": 0.6, "carpet_cotton": 0.4},
                 "ceiling": {"ceiling_fibre_absorber": 1.0},
             },
         }
@@ -239,6 +253,103 @@ def classify_materials(
         best, dists = _heuristic_classify(img, floor_frac, ceiling_frac)
 
     return {**best, "distributions": dists}
+
+
+# -----------------------------------------------------------------------
+# SAMOSA emulation utilities
+# -----------------------------------------------------------------------
+
+_mobilenet_cache: dict = {}
+
+
+def run_mobilenet_timing(image_path: str, device: str) -> float:
+    """
+    Run a non-fine-tuned MobileNetV2 forward pass and return inference-only ms.
+    The output is discarded — this exists solely to consume compute time
+    equivalent to SAMOSA's fine-tuned MobileNetV2 segmentation module.
+
+    Both the model and the preprocessed tensor are cached for the process
+    lifetime.  Image loading and preprocessing are NOT included in the
+    returned time (SAMOSA receives a live camera frame already in GPU memory;
+    we replicate that by caching the tensor after the first call).
+    """
+    import time
+    import torch
+    import torchvision.transforms as T
+    from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+
+    cache_key = (image_path, device)
+
+    if _mobilenet_cache.get("device") != device:
+        model = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+        model.to(device).eval()
+        # Warmup pass so CUDA kernels are compiled before the first timed run
+        dummy = torch.zeros(1, 3, 224, 224, device=device)
+        with torch.no_grad():
+            model(dummy)
+        _mobilenet_cache["model"] = model
+        _mobilenet_cache["device"] = device
+        _mobilenet_cache["transform"] = T.Compose([
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    # Cache the preprocessed tensor — image loading is not part of the timed
+    # inference (mirrors a live camera feed already resident in GPU memory).
+    if _mobilenet_cache.get("tensor_key") != cache_key:
+        img = Image.open(image_path).convert("RGB")
+        tensor = _mobilenet_cache["transform"](img).unsqueeze(0).to(device)
+        _mobilenet_cache["tensor"] = tensor
+        _mobilenet_cache["tensor_key"] = cache_key
+
+    model = _mobilenet_cache["model"]
+    tensor = _mobilenet_cache["tensor"]
+
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        _ = model(tensor)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    return (time.perf_counter() - t0) * 1000
+
+
+def save_segmentation_cache(result: dict, cache_path: str):
+    """
+    Save a classify_materials() result dict to JSON for later use in
+    SAMOSA emulation mode.  Only strings and floats are stored (no numpy).
+    """
+    import json
+
+    # distributions values are plain Python floats already; just serialise
+    serialisable = {
+        "walls":   result["walls"],
+        "floor":   result["floor"],
+        "ceiling": result["ceiling"],
+        "distributions": result.get("distributions", {}),
+    }
+    with open(cache_path, "w") as f:
+        json.dump(serialisable, f, indent=2)
+
+
+def load_segmentation_cache(cache_path: str) -> dict:
+    """
+    Load a previously saved segmentation cache.
+    Raises FileNotFoundError with a helpful message if the file is missing.
+    """
+    import json
+    import os
+
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Segmentation cache not found: {cache_path}\n"
+            "Run with --init-segmentation first to generate it."
+        )
+    with open(cache_path) as f:
+        return json.load(f)
 
 
 if __name__ == "__main__":

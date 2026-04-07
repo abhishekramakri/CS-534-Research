@@ -21,10 +21,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from profiler import Profiler
 from shoebox import estimate_shoebox
-from segmentation import classify_materials
+from segmentation import (
+    classify_materials,
+    run_mobilenet_timing,
+    save_segmentation_cache,
+    load_segmentation_cache,
+)
 from scene_classifier import classify_scene
 from acoustics import compute_rir
 from render import apply_rir
+
+
+def init_segmentation(image_path: str, cache_path: str, device: str | None = None):
+    """
+    One-time SegFormer run: classify materials and save to cache.
+    Called when --init-segmentation is passed; does not run the full pipeline.
+    """
+    print("=" * 52)
+    print("  Segmentation Init (SegFormer)")
+    print("=" * 52)
+    print(f"\nRunning SegFormer on: {image_path}")
+
+    result = classify_materials(image_path, method="segformer", device=device)
+    save_segmentation_cache(result, cache_path)
+
+    print("\nMaterials:")
+    for s in ("walls", "floor", "ceiling"):
+        print(f"  {s:8s}: {result[s]}")
+    print("\nDistributions:")
+    for s, dist in result["distributions"].items():
+        fracs = ", ".join(f"{m}: {v:.0%}" for m, v in dist.items())
+        print(f"  {s:8s}: {fracs}")
+    print(f"\nCache saved → {cache_path}")
 
 
 def run(
@@ -33,6 +61,8 @@ def run(
     input_audio: str,
     output_audio: str,
     seg_method: str = "segformer",
+    samosa_mode: bool = False,
+    seg_cache: str = "segmentation_cache.json",
     fs: int = 16000,
     max_order: int | None = None,
     device: str | None = None,
@@ -56,17 +86,27 @@ def run(
 
     def _run_segmentation():
         nonlocal seg_result
-        with prof.timer("2. Material segmentation"):
-            seg_result = classify_materials(image_path, method=seg_method, device=device)
+        if samosa_mode:
+            # SAMOSA emulation: load SegFormer cache for material accuracy,
+            # run MobileNetV2 inference to match SAMOSA's ~10ms compute cost.
+            # run_mobilenet_timing() returns inference-only ms (preprocessed
+            # tensor cached, CUDA warmed up) — record that directly so we
+            # don't inflate the number with image loading overhead.
+            seg_result = load_segmentation_cache(seg_cache)
+            inference_ms = run_mobilenet_timing(image_path, device or "cuda")
+            prof._timings["2. Seg (MobileNetV2 timing, SAMOSA mode)"] = inference_ms
+        else:
+            with prof.timer("2. Material segmentation"):
+                seg_result = classify_materials(image_path, method=seg_method, device=device)
 
-    print("\n[Phase 1] Running perception modules in parallel...")
+    mode_label = "SAMOSA emulation" if samosa_mode else seg_method
+    print(f"\n[Phase 1] Running perception modules in parallel (seg={mode_label})...")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
             pool.submit(_run_shoebox),
             pool.submit(_run_segmentation),
         ]
-        # Wait and re-raise any exceptions
         for f in as_completed(futures):
             f.result()
 
@@ -149,7 +189,7 @@ def main():
                         help="Reverberant output audio")
     parser.add_argument("--seg-method", default="segformer",
                         choices=["segformer", "heuristic"],
-                        help="Segmentation method")
+                        help="Segmentation method (normal mode)")
     parser.add_argument("--fs",        type=int, default=16000,
                         help="Sample rate (Hz)")
     parser.add_argument("--max-order", type=int, default=None,
@@ -157,7 +197,25 @@ def main():
     parser.add_argument("--device",    default=None,
                         help="Torch device: cuda / cpu / auto")
 
+    # SAMOSA emulation flags
+    parser.add_argument("--samosa-mode", action="store_true",
+                        help="SAMOSA emulation: use cached SegFormer materials + "
+                             "MobileNetV2 timing dummy to match SAMOSA compute profile")
+    parser.add_argument("--init-segmentation", action="store_true",
+                        help="Run SegFormer once, save segmentation cache, then exit. "
+                             "Required before --samosa-mode.")
+    parser.add_argument("--seg-cache", default="segmentation_cache.json",
+                        help="Path to segmentation cache file (default: segmentation_cache.json)")
+
     args = parser.parse_args()
+
+    if args.init_segmentation:
+        init_segmentation(
+            image_path=args.image,
+            cache_path=args.seg_cache,
+            device=args.device,
+        )
+        return
 
     run(
         ply_path=args.ply,
@@ -165,6 +223,8 @@ def main():
         input_audio=args.input,
         output_audio=args.output,
         seg_method=args.seg_method,
+        samosa_mode=args.samosa_mode,
+        seg_cache=args.seg_cache,
         fs=args.fs,
         max_order=args.max_order,
         device=args.device,

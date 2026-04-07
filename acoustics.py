@@ -12,7 +12,7 @@ import pyroomacoustics as pra
 # Maps surface type → pyroomacoustics material name (fallback defaults).
 DEFAULT_MATERIALS = {
     "walls":   "plasterboard",
-    "floor":   "carpet_cotton",
+    "floor":   "wood_16mm",
     "ceiling": "ceiling_fibre_absorber",
 }
 
@@ -25,16 +25,19 @@ ABSORPTION_TABLE = {
     "brickwork":              [0.05, 0.04, 0.02, 0.04, 0.05, 0.05],
     "carpet_cotton":          [0.07, 0.31, 0.49, 0.81, 0.66, 0.54],
     "carpet_hairy":           [0.11, 0.14, 0.37, 0.43, 0.27, 0.25],
-    "linoleum":               [0.02, 0.02, 0.03, 0.04, 0.04, 0.05],
-    "parquet_wood_22mm":      [0.04, 0.04, 0.07, 0.06, 0.06, 0.07],
+    "linoleum_on_concrete":   [0.02, 0.02, 0.03, 0.04, 0.04, 0.05],
+    "wood_16mm":              [0.18, 0.12, 0.10, 0.09, 0.08, 0.07],
     "concrete_floor":         [0.01, 0.01, 0.02, 0.02, 0.02, 0.05],
     "marble_floor":           [0.01, 0.01, 0.01, 0.02, 0.02, 0.02],
-    "concrete_block_wall":    [0.36, 0.44, 0.31, 0.29, 0.39, 0.25],
-    "plasterboard":           [0.15, 0.11, 0.04, 0.04, 0.07, 0.14],
-    "wood_panel":             [0.42, 0.21, 0.10, 0.08, 0.06, 0.06],
     "rough_concrete":         [0.02, 0.03, 0.03, 0.03, 0.04, 0.07],
+    "plasterboard":           [0.15, 0.11, 0.04, 0.04, 0.07, 0.14],
+    "gypsum_board":           [0.15, 0.11, 0.04, 0.04, 0.07, 0.14],
+    "wooden_lining":          [0.42, 0.21, 0.10, 0.08, 0.06, 0.06],
+    "wooden_door":            [0.14, 0.10, 0.06, 0.08, 0.10, 0.10],
+    "glass_window":           [0.35, 0.25, 0.18, 0.12, 0.07, 0.04],
+    "curtains_densely_woven": [0.07, 0.31, 0.49, 0.75, 0.70, 0.60],
     "ceiling_fibre_absorber": [0.33, 0.44, 0.82, 0.90, 0.92, 0.83],
-    "wood_16mm":              [0.18, 0.12, 0.10, 0.09, 0.08, 0.07],
+    "ceiling_plasterboard":   [0.15, 0.11, 0.04, 0.04, 0.07, 0.14],
 }
 
 
@@ -167,10 +170,10 @@ if __name__ == "__main__":
         {
             "name": "Blended distribution test (5x4x2.8m)",
             "dims": [5, 4, 2.8],
-            "materials": {"walls": "plasterboard", "floor": "parquet_wood_22mm", "ceiling": "ceiling_fibre_absorber"},
+            "materials": {"walls": "plasterboard", "floor": "wood_16mm", "ceiling": "ceiling_fibre_absorber"},
             "distributions": {
                 "walls":   {"plasterboard": 0.7, "wood_panel": 0.2, "brickwork": 0.1},
-                "floor":   {"carpet_cotton": 0.4, "parquet_wood_22mm": 0.6},
+                "floor":   {"carpet_cotton": 0.4, "wood_16mm": 0.6},
                 "ceiling": {"ceiling_fibre_absorber": 1.0},
             },
         },

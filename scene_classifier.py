@@ -131,7 +131,7 @@ if __name__ == "__main__":
     # Quick test with example distributions
     test_dist = {
         "walls":   {"plasterboard": 0.85, "wood_panel": 0.15},
-        "floor":   {"carpet_cotton": 0.6, "parquet_wood_22mm": 0.4},
+        "floor":   {"carpet_cotton": 0.6, "wood_16mm": 0.4},
         "ceiling": {"ceiling_fibre_absorber": 1.0},
     }
     scene, preset = classify_scene(
