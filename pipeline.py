@@ -93,7 +93,17 @@ def run(
             # tensor cached, CUDA warmed up) — record that directly so we
             # don't inflate the number with image loading overhead.
             seg_result = load_segmentation_cache(seg_cache)
-            inference_ms = run_mobilenet_timing(image_path, device or "cuda")
+            import torch
+            if device is None:
+                if torch.cuda.is_available():
+                    _device = "cuda"
+                elif torch.backends.mps.is_available():
+                    _device = "mps"
+                else:
+                    _device = "cpu"
+            else:
+                _device = device
+            inference_ms = run_mobilenet_timing(image_path, _device)
             prof._timings["2. Seg (MobileNetV2 timing, SAMOSA mode)"] = inference_ms
         else:
             with prof.timer("2. Material segmentation"):

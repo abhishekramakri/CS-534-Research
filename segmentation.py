@@ -264,40 +264,42 @@ _mobilenet_cache: dict = {}
 
 def run_mobilenet_timing(image_path: str, device: str) -> float:
     """
-    Run a non-fine-tuned MobileNetV2 forward pass and return inference-only ms.
-    The output is discarded — this exists solely to consume compute time
-    equivalent to SAMOSA's fine-tuned MobileNetV2 segmentation module.
+    Run DeepLabV3 with MobileNetV3-Large backbone and return inference-only ms.
+    The output is discarded — this exists to approximate the compute profile of
+    SAMOSA's DeepLabv3+ MobileNetV2 segmentation module (full-resolution dense
+    prediction, MobileNet backbone), without needing to retrain on ADE20K.
 
     Both the model and the preprocessed tensor are cached for the process
     lifetime.  Image loading and preprocessing are NOT included in the
-    returned time (SAMOSA receives a live camera frame already in GPU memory;
-    we replicate that by caching the tensor after the first call).
+    returned time.
     """
     import time
     import torch
     import torchvision.transforms as T
-    from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+    from torchvision.models.segmentation import (
+        deeplabv3_mobilenet_v3_large,
+        DeepLabV3_MobileNet_V3_Large_Weights,
+    )
 
     cache_key = (image_path, device)
 
     if _mobilenet_cache.get("device") != device:
-        model = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+        model = deeplabv3_mobilenet_v3_large(
+            weights=DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
+        )
         model.to(device).eval()
-        # Warmup pass so CUDA kernels are compiled before the first timed run
-        dummy = torch.zeros(1, 3, 224, 224, device=device)
+        # Warmup pass so kernels are compiled before the first timed run
+        dummy = torch.zeros(1, 3, 520, 520, device=device)
         with torch.no_grad():
             model(dummy)
         _mobilenet_cache["model"] = model
         _mobilenet_cache["device"] = device
         _mobilenet_cache["transform"] = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(224),
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-    # Cache the preprocessed tensor — image loading is not part of the timed
-    # inference (mirrors a live camera feed already resident in GPU memory).
+    # Cache the preprocessed tensor at full resolution
     if _mobilenet_cache.get("tensor_key") != cache_key:
         img = Image.open(image_path).convert("RGB")
         tensor = _mobilenet_cache["transform"](img).unsqueeze(0).to(device)
