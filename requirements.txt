@@ -1,0 +1,19 @@
+# Core acoustics
+pyroomacoustics
+numpy
+scipy
+soundfile
+
+# Shoebox estimation (PLY loading)
+open3d
+trimesh
+
+# Material segmentation (SegFormer)
+torch
+torchvision
+transformers
+accelerate
+timm
+
+# Image processing
+pillow

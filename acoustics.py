@@ -1,21 +1,78 @@
 """
 acoustics.py
 Computes a Room Impulse Response (RIR) from room dimensions and surface materials
-using pyroomacoustics. This is the core of the SAMOSA pipeline.
+using pyroomacoustics.  Supports both named materials (string) and blended
+absorption distributions from segmentation.py.
 """
 
 import numpy as np
 import pyroomacoustics as pra
 
 
-# Maps surface type → pyroomacoustics material name.
-# These will later be filled in by segmentation.py outputs.
-# Full list of available materials: pra.materials_absorption_table.keys()
+# Maps surface type → pyroomacoustics material name (fallback defaults).
 DEFAULT_MATERIALS = {
-    "walls":   "brickwork",
+    "walls":   "plasterboard",
     "floor":   "carpet_cotton",
     "ceiling": "ceiling_fibre_absorber",
 }
+
+# Octave-band centre frequencies used for absorption blending
+OCTAVE_BANDS = [125, 250, 500, 1000, 2000, 4000]
+
+# Absorption coefficients at OCTAVE_BANDS for each material we support.
+# Sources: ISO 354 / Vorländer (2008) / Kuttruff (2009).
+ABSORPTION_TABLE = {
+    "brickwork":              [0.05, 0.04, 0.02, 0.04, 0.05, 0.05],
+    "carpet_cotton":          [0.07, 0.31, 0.49, 0.81, 0.66, 0.54],
+    "carpet_hairy":           [0.11, 0.14, 0.37, 0.43, 0.27, 0.25],
+    "linoleum":               [0.02, 0.02, 0.03, 0.04, 0.04, 0.05],
+    "parquet_wood_22mm":      [0.04, 0.04, 0.07, 0.06, 0.06, 0.07],
+    "concrete_floor":         [0.01, 0.01, 0.02, 0.02, 0.02, 0.05],
+    "marble_floor":           [0.01, 0.01, 0.01, 0.02, 0.02, 0.02],
+    "concrete_block_wall":    [0.36, 0.44, 0.31, 0.29, 0.39, 0.25],
+    "plasterboard":           [0.15, 0.11, 0.04, 0.04, 0.07, 0.14],
+    "wood_panel":             [0.42, 0.21, 0.10, 0.08, 0.06, 0.06],
+    "rough_concrete":         [0.02, 0.03, 0.03, 0.03, 0.04, 0.07],
+    "ceiling_fibre_absorber": [0.33, 0.44, 0.82, 0.90, 0.92, 0.83],
+    "wood_16mm":              [0.18, 0.12, 0.10, 0.09, 0.08, 0.07],
+}
+
+
+def _blend_absorption(distribution: dict) -> list[float]:
+    """
+    Weighted-average absorption coefficients from a material distribution.
+    distribution: {"plasterboard": 0.85, "wood_panel": 0.15}
+    Returns list of 6 coefficients at OCTAVE_BANDS.
+    """
+    blended = np.zeros(len(OCTAVE_BANDS), dtype=float)
+    total_weight = 0.0
+
+    for mat_name, fraction in distribution.items():
+        if mat_name in ABSORPTION_TABLE:
+            blended += fraction * np.array(ABSORPTION_TABLE[mat_name])
+            total_weight += fraction
+        else:
+            # Unknown material — use a mid-range default
+            blended += fraction * np.array([0.10, 0.10, 0.10, 0.10, 0.10, 0.10])
+            total_weight += fraction
+
+    if total_weight > 0:
+        blended /= total_weight
+
+    return blended.tolist()
+
+
+def _resolve_material(surface_key: str, materials: dict, distributions: dict | None):
+    """
+    Return a scalar or string that pra.make_materials() can wrap.
+    - distributions present → scalar mean absorption (float)
+    - otherwise            → named material string
+    pra.make_materials() handles both via Material(scalar) and Material(string).
+    """
+    if distributions and surface_key in distributions:
+        coeffs = _blend_absorption(distributions[surface_key])
+        return float(np.mean(coeffs))   # scalar mean — version-safe
+    return materials[surface_key]       # named string
 
 
 def compute_rir(
@@ -25,17 +82,20 @@ def compute_rir(
     listener_pos=None,
     fs=16000,
     max_order=17,
+    distributions=None,
 ):
     """
     Compute a Room Impulse Response.
 
     Args:
-        room_dims:    [width, length, height] in meters
-        materials:    dict with keys "walls", "floor", "ceiling" → material name string
-        source_pos:   [x, y, z] of audio source. Defaults to center of room offset slightly.
-        listener_pos: [x, y, z] of listener. Defaults to opposite offset from center.
-        fs:           sample rate (Hz)
-        max_order:    image source method reflection order (3 is a good tradeoff)
+        room_dims:      [width, length, height] in metres
+        materials:       dict  {"walls": str, "floor": str, "ceiling": str}
+        source_pos:     [x, y, z] of audio source
+        listener_pos:   [x, y, z] of listener
+        fs:             sample rate (Hz)
+        max_order:      image-source-method reflection order
+        distributions:  optional per-surface material distributions from segmentation.py
+                        e.g. {"walls": {"plasterboard": 0.8, "wood_panel": 0.2}, ...}
 
     Returns:
         rir: np.ndarray — the room impulse response
@@ -46,21 +106,23 @@ def compute_rir(
 
     w, l, h = room_dims
 
-    # Default positions: source and listener on opposite sides of room center
     if source_pos is None:
         source_pos = [w * 0.25, l * 0.5, h * 0.5]
     if listener_pos is None:
         listener_pos = [w * 0.75, l * 0.5, h * 0.5]
 
-    # Build per-surface material object
+    wall_param  = _resolve_material("walls",   materials, distributions)
+    floor_param = _resolve_material("floor",   materials, distributions)
+    ceil_param  = _resolve_material("ceiling", materials, distributions)
+
     # ShoeBox surface order: east, west, north, south, floor, ceiling
     room_materials = pra.make_materials(
-        east=materials["walls"],
-        west=materials["walls"],
-        north=materials["walls"],
-        south=materials["walls"],
-        floor=materials["floor"],
-        ceiling=materials["ceiling"],
+        east=wall_param,
+        west=wall_param,
+        north=wall_param,
+        south=wall_param,
+        floor=floor_param,
+        ceiling=ceil_param,
     )
 
     room = pra.ShoeBox(
@@ -82,6 +144,8 @@ def compute_rir(
 
 
 if __name__ == "__main__":
+    import time as _time
+
     print("=== acoustics.py sanity check ===\n")
 
     configs = [
@@ -100,16 +164,28 @@ if __name__ == "__main__":
             "dims": [8, 6, 3],
             "materials": {"walls": "brickwork", "floor": "wood_16mm", "ceiling": "ceiling_fibre_absorber"},
         },
+        {
+            "name": "Blended distribution test (5x4x2.8m)",
+            "dims": [5, 4, 2.8],
+            "materials": {"walls": "plasterboard", "floor": "parquet_wood_22mm", "ceiling": "ceiling_fibre_absorber"},
+            "distributions": {
+                "walls":   {"plasterboard": 0.7, "wood_panel": 0.2, "brickwork": 0.1},
+                "floor":   {"carpet_cotton": 0.4, "parquet_wood_22mm": 0.6},
+                "ceiling": {"ceiling_fibre_absorber": 1.0},
+            },
+        },
     ]
 
     for cfg in configs:
-        import time
-        t_start = time.perf_counter()
-        rir, t60 = compute_rir(cfg["dims"], cfg["materials"])
-        elapsed = (time.perf_counter() - t_start) * 1000
+        t_start = _time.perf_counter()
+        rir, t60 = compute_rir(
+            cfg["dims"], cfg["materials"],
+            distributions=cfg.get("distributions"),
+        )
+        elapsed = (_time.perf_counter() - t_start) * 1000
 
         print(f"{cfg['name']}")
         print(f"  RIR length: {len(rir)} samples ({len(rir)/16000*1000:.1f}ms)")
         print(f"  T60:        {t60:.3f}s")
-        print(f"  Compute time: {elapsed:.1f}ms")
+        print(f"  Compute:    {elapsed:.1f}ms")
         print()
