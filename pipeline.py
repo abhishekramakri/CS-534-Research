@@ -20,7 +20,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from profiler import Profiler
-from shoebox import estimate_shoebox
+from shoebox import estimate_shoebox, estimate_shoebox_from_ply
 from segmentation import (
     classify_materials,
     run_mobilenet_timing,
@@ -56,7 +56,7 @@ def init_segmentation(image_path: str, cache_path: str, device: str | None = Non
 
 
 def run(
-    ply_path: str,
+    scene_dir: str,
     image_path: str,
     input_audio: str,
     output_audio: str,
@@ -66,6 +66,7 @@ def run(
     fs: int = 16000,
     max_order: int | None = None,
     device: str | None = None,
+    ply_path: str | None = None,
 ):
     prof = Profiler()
 
@@ -82,7 +83,10 @@ def run(
     def _run_shoebox():
         nonlocal geo
         with prof.timer("1. Shoebox estimation"):
-            geo = estimate_shoebox(ply_path)
+            if ply_path is not None:
+                geo = estimate_shoebox_from_ply(ply_path)
+            else:
+                geo = estimate_shoebox(scene_dir)
 
     def _run_segmentation():
         nonlocal seg_result
@@ -189,10 +193,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="SAMOSA-style end-to-end acoustic rendering pipeline",
     )
-    parser.add_argument("--ply",       default="testing/modernroom.ply",
-                        help="Path to room PLY mesh")
-    parser.add_argument("--image",     default="testing/modernroom.png",
-                        help="Path to room RGB render")
+    parser.add_argument("--scene",     default="scannet/scene0005",
+                        help="Path to ScanNet scene dir (contains calibration.txt + images/)")
+    parser.add_argument("--ply",       default=None,
+                        help="Path to PLY mesh (overrides --scene for geometry; synthetic scenes only)")
+    parser.add_argument("--image",     default=None,
+                        help="Path to RGB image for segmentation. "
+                             "If omitted, uses the first color frame from --scene.")
     parser.add_argument("--input",     default="audio/test.wav",
                         help="Dry input audio")
     parser.add_argument("--output",    default="audio/output_pipeline.wav",
@@ -219,17 +226,32 @@ def main():
 
     args = parser.parse_args()
 
+    # Auto-pick the first color frame from the scene dir if --image not given
+    import glob as _glob
+    image_path = args.image
+    if image_path is None:
+        frames = sorted(_glob.glob(
+            os.path.join(args.scene, "images", "*.color.png")
+        ))
+        if not frames:
+            raise FileNotFoundError(
+                f"No *.color.png frames found in {args.scene}/images/. "
+                "Pass --image explicitly."
+            )
+        image_path = frames[0]
+        print(f"[pipeline] Using image: {image_path}")
+
     if args.init_segmentation:
         init_segmentation(
-            image_path=args.image,
+            image_path=image_path,
             cache_path=args.seg_cache,
             device=args.device,
         )
         return
 
     run(
-        ply_path=args.ply,
-        image_path=args.image,
+        scene_dir=args.scene,
+        image_path=image_path,
         input_audio=args.input,
         output_audio=args.output,
         seg_method=args.seg_method,
@@ -238,6 +260,7 @@ def main():
         fs=args.fs,
         max_order=args.max_order,
         device=args.device,
+        ply_path=args.ply,
     )
 
 
