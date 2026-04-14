@@ -8,6 +8,7 @@ __pycache__/
 
 # Data files (too large for git)
 *.sens
+scannet/
 
 # Jupyter
 .ipynb_checkpoints/
