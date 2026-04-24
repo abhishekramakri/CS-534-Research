@@ -1,0 +1,337 @@
+\documentclass[11pt]{article}
+
+% ---- Fonts & encoding ----
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathptmx}
+
+% ---- Page geometry ----
+\usepackage[top=1in, bottom=1in, left=1in, right=1in]{geometry}
+
+% ---- Packages ----
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{indentfirst}
+
+% ---- Section formatting ----
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\titlespacing*{\subsection}{0pt}{8pt}{2pt}
+
+% ---- Spacing ----
+\setlength{\parindent}{1em}
+\setlength{\parskip}{3pt}
+
+% ---- Header info ----
+\title{\textbf{Offloaded Spatial Audio Rendering for XR:\\
+       Latency, Power, and Quality Tradeoffs}\\[6pt]
+       \normalsize CS 534 IC -- Progress Report -- Spring 2026}
+\author{Abhi Ramakrishnan \quad Sethu Eapen\\
+        \small University of Illinois at Urbana-Champaign}
+\date{}
+
+% -----------------------------------------------------------------------
+\begin{document}
+\maketitle
+\thispagestyle{plain}
+
+% -----------------------------------------------------------------------
+\section{Introduction}
+% -----------------------------------------------------------------------
+
+Spatial audio is an important part of XR immersion. When sound does not
+match the physical space a user is in, it is immediately noticeable.
+Environment-aware spatial audio addresses this by adapting to the actual
+geometry and surface materials of the room, producing a Room Impulse
+Response (RIR) that captures how sound propagates in that specific space.
+
+Running this pipeline on a headset is expensive. SAMOSA (Xu et al., UIST 2025),
+a recent system for on-device scene-aware spatial audio, achieves 58\,ms
+to compute an updated Room Impulse Response (RIR) on a Snapdragon XR2+ Gen 2
+chip. This update latency matters because it determines how quickly the
+acoustic model can adapt when a user moves to a new position in a space.
+SAMOSA was only evaluated on a single chip, leaving open questions about
+how it performs on other hardware.
+
+A natural response to on-device cost is offloading computation to a nearby
+server, which is the approach taken by RemoteVIO (Jiang et al., MMSys 2025)
+for visual-inertial odometry in ILLIXR. For spatial audio, however, offloading
+introduces a different constraint: audio-visual synchronization. Prior work
+(Yeregui et al., 2024) measured audio latencies of 185\,ms over Ethernet
+when fully offloading the XR rendering pipeline, exceeding the 160\,ms
+threshold above which audio-video desync becomes noticeable to users. Full
+offloading does not appear viable for audio, but a partial offload that keeps
+lightweight steps on the headset and sends only the heavy ML inference to the
+server might stay within budget.
+
+We study the latency, power, and audio quality tradeoffs of different
+offloading split points for a scene-aware spatial audio pipeline, using
+a MacBook as the device proxy and a Jetson Orin AGX as the server.
+
+% -----------------------------------------------------------------------
+\section{Related Work}
+% -----------------------------------------------------------------------
+
+\subsection{SAMOSA}
+
+Xu et al.\ present an on-device system for scene-aware spatial
+audio in XR. The pipeline runs four stages: shoebox room geometry estimation
+from depth data, pixel-wise surface material classification using DeepLabv3+,
+room type classification using MobileNetV2 to further refine acoustic
+parameters, and RIR synthesis via the Image Source Method. It achieves
+58\,ms end-to-end with under 3\% CPU usage on a Snapdragon XR2+ Gen 2.
+Our pipeline follows the same structure but omits the MobileNetV2 room
+classification step, focusing on the geometry and material inference stages
+and how they partition across device and server. Notably, SAMOSA reports
+only aggregate latency and does not break down timing per stage; our
+profiling infrastructure provides this breakdown.
+
+\subsection{RemoteVIO}
+
+Jiang et al.\ study offloading of head tracking (VIO) in an
+end-to-end ILLIXR deployment, showing that careful partitioning of a
+latency-sensitive XR workload can reduce headset power without unacceptable
+quality loss. We follow the same experimental structure
+applied to the spatial audio pipeline instead of VIO.
+
+\subsection{Edge Rendering for XR}
+
+Yeregui et al.\ fully offload XR rendering and audio to an edge
+server, measuring 185\,ms audio latency over Ethernet and up to 324\,ms
+over WiFi. They establish 160\,ms as the perceptual threshold above which
+audio-visual desync becomes noticeable. Our work asks whether a smarter
+partial offload can stay within that budget where full offloading cannot.
+
+% -----------------------------------------------------------------------
+\section{Approach and Evaluation Plan}
+% -----------------------------------------------------------------------
+
+\subsection{System Architecture}
+
+We build a scene-aware spatial audio pipeline using open-source components.
+A MacBook serves as the device proxy and a Jetson Orin AGX serves as the
+server, connected over a local network. The pipeline is implemented in Python,
+with each stage as a standalone module. On the device side, shoebox room
+geometry is estimated from a PLY mesh or depth frame and binaural rendering
+is handled via Steam Audio, which requires continuous access to the current
+head pose. On the server side, a Python process (\texttt{server.py}) accepts
+RGB frames, runs material segmentation, computes the RIR using
+\texttt{pyroomacoustics}, and returns the result over a local network socket.
+
+We run segmentation in two modes, selectable via a flag. In the first mode,
+SegFormer-b0 (Xie et al., NeurIPS 2021) pretrained on ADE20K runs inference
+and its output feeds directly into RIR computation. In the second mode,
+DeepLabv3+ with a MobileNetV3 backbone (torchvision pretrained) runs inference
+for timing purposes only; its output is discarded and materials are set from
+a fixed default, since this model is trained on PASCAL VOC and does not produce
+valid indoor surface labels. The second mode lets us measure what segmentation
+latency would look like with a lighter, SAMOSA-class model on our hardware
+without needing to retrain on ADE20K. Audio quality metrics are only reported
+for the SegFormer mode.
+
+\subsection{Offloading Configurations}
+
+\begin{table}[H]
+\small\centering
+\caption{Offloading configurations.}
+\label{tab:configs}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Config} & \textbf{On Device} & \textbf{On Server} & \textbf{Expected tradeoff}\\
+\midrule
+A (baseline) & Geometry + Materials + RIR & Nothing                & Highest power, lowest latency\\
+B (partial)  & Geometry + RIR             & Materials              & Moderate savings\\
+C (heavy)    & Geometry                   & Materials + RIR        & Large savings, latency risk\\
+D (full)     & Nothing                    & Geometry + Materials + RIR & Lowest power, likely too slow\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Binaural rendering via Steam Audio runs on device in all configurations, as
+it requires continuous access to the current head pose and the local audio
+source. Config A reproduces the SAMOSA on-device baseline. Configs B and C
+are partial offloads at different granularities. Config D sends all scene
+processing to the server and corresponds to the full-offload case studied
+by Yeregui et al., which we expect to exceed the perceptual budget.
+
+\subsection{Metrics}
+
+For each configuration we measure:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{End-to-end latency}: time from camera frame capture to
+        rendered audio output, compared against the 160\,ms threshold.
+  \item \textbf{Per-step latency}: breakdown across depth estimation,
+        material inference, RIR computation, and rendering.
+  \item \textbf{Network bandwidth}: bytes transmitted per frame for each config.
+  \item \textbf{Audio quality}: RIR similarity against a ground truth RIR
+        computed by running \texttt{pyroomacoustics} directly on ScanNet's
+        known room geometry, using reverberation time ($T_{60}$) and
+        normalized echo density as metrics.
+\end{itemize}
+
+Experiments run on a MacBook and Jetson Orin AGX connected over a local
+network, with additional WiFi runs to test sensitivity to network conditions.
+
+% -----------------------------------------------------------------------
+\section{Methodology}
+% -----------------------------------------------------------------------
+
+The pipeline is implemented in Python with five standalone modules:
+\texttt{shoebox.py} (PLY loading, PCA alignment, AABB room estimation),
+\texttt{segmentation.py} (SegFormer-b0 via HuggingFace Transformers, ADE20K class mapping),
+\texttt{scene\_classifier.py} (rule-based acoustic preset selection),
+\texttt{acoustics.py} (pyroomacoustics ShoeBox RIR computation), and
+\texttt{render.py} (FFT convolution via scipy). A \texttt{profiler.py} module
+wraps every stage with \texttt{perf\_counter} timers to produce per-stage latency
+breakdowns. The full pipeline is orchestrated by \texttt{pipeline.py}, which runs
+shoebox estimation and material segmentation in parallel via \texttt{ThreadPoolExecutor}.
+
+SegFormer model weights are cached at the module level so they are loaded from
+disk only once per server process, reflecting the deployment scenario where the
+server handles repeated RIR update requests without restarting.
+
+Currently, the pipeline takes a pre-made PLY mesh and a static RGB render as
+inputs, with source and listener positions set to fixed offsets within the room.
+The next step is to replace these with inputs from ScanNet, a dataset of
+RGB-D indoor scans where each scene includes per-frame depth, RGB, and camera
+poses alongside a ground-truth PLY mesh. With ScanNet, the depth frame drives
+shoebox estimation directly and the camera pose provides the real listener
+position, removing the hardcoded placement. The ground-truth PLY mesh serves
+as a reference: running pyroomacoustics on it produces a reference RIR that
+we compare against our pipeline's output using $T_{60}$ and normalized echo
+density as audio quality metrics.
+
+% -----------------------------------------------------------------------
+\section{Preliminary Results}
+% -----------------------------------------------------------------------
+
+Table~\ref{tab:results} shows per-stage  latency for Config A on a desktop workstation with a NVIDIA RTX 4090 (24 GB VRAM). Material segmentation dominates at 139--273\,ms,
+accounting for over 95\% of total pipeline time. All other stages are under
+25\,ms combined.
+
+\begin{table}[H]
+\small\centering
+\caption{Per-stage latency, Config A (all on-device, CPU, warm runs).}
+\label{tab:results}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Stage} & \textbf{Latency (ms)}\\
+\midrule
+Shoebox estimation     & 8\,--\,16\\
+Material segmentation  & 139\,--\,273\\
+Scene classification   & $<$1\\
+RIR synthesis          & 3\,--\,4\\
+Audio rendering        & 5\,--\,6\\
+\midrule
+\textbf{Total}         & \textbf{155\,--\,300}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The total pipeline latency of 155--300\,ms is substantially higher than SAMOSA's
+reported 58\,ms end-to-end. The gap is driven almost entirely by segmentation:
+our SegFormer inference takes 139--273\,ms per frame, whereas SAMOSA's fine-tuned
+DeepLabv3+ MobileNetV2 is reported to run in approximately 10\,ms on dedicated
+mobile hardware. The remaining stages---shoebox estimation (8--16\,ms), RIR
+synthesis (3--4\,ms), and audio rendering (5--6\,ms)---are broadly comparable to
+what SAMOSA would require for equivalent geometry and synthesis steps. Replacing
+or offloading the segmentation module is therefore the single most impactful
+change available.
+
+\subsection{SAMOSA Emulation Mode}
+
+To measure what the pipeline would look like with a SAMOSA-class segmentation
+model, we introduced a SAMOSA emulation mode (\texttt{--samosa-mode}). In this
+mode, material labels are loaded from a pre-computed SegFormer cache
+(\texttt{segmentation\_cache.json}) and DeepLabv3+ with a MobileNetV3-Large
+backbone (torchvision pretrained) is run solely to consume equivalent compute
+time; its output is discarded. This matches the architectural profile of
+SAMOSA's segmentation slot without requiring a fine-tuned model.
+
+\begin{table}[H]
+\small\centering
+\caption{Per-stage latency, Config A SAMOSA emulation mode (warm pipeline runs, RTX 4090).}
+\label{tab:samosa_results}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Stage} & \textbf{Latency (ms)}\\
+\midrule
+Shoebox estimation                  & 6.9\,--\,9.6\\
+Segmentation (MobileNetV3, SAMOSA)  & 39.7\,--\,59.7\\
+Scene classification                & $<$1\\
+RIR synthesis                       & 3.3\,--\,9.4\\
+Audio rendering                     & 1.7\,--\,4.6\\
+\midrule
+\textbf{Total}                      & \textbf{53.1\,--\,82.6}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The SAMOSA emulation mode total of 53--83\,ms is closely comparable to SAMOSA's
+reported 58\,ms, confirming that the pipeline architecture and non-segmentation
+stages are well-matched to SAMOSA's performance envelope. The segmentation slot
+(39.7--59.7\,ms in these runs) is elevated relative to the true inference cost
+because each \texttt{pipeline.py} invocation is a fresh process that must load
+the DeepLabv3+ weights from disk before the first timed call. When the
+segmentation module is run in isolation within a persistent process---as it
+would be in a deployed server that handles repeated RIR update
+requests---inference time drops to approximately 8.6\,ms (median, RTX 4090,
+CUDA, 5 warm runs). A persistent server process would therefore bring the
+segmentation slot to under 10\,ms and the total pipeline latency to under
+30\,ms, comfortably within SAMOSA's 58\,ms reference and well below the
+160\,ms perceptual threshold.
+
+% -----------------------------------------------------------------------
+\section{Changes from Original Proposal}
+% -----------------------------------------------------------------------
+
+\textbf{Testbed: MacBook + Jetson Orin without ILLIXR.}
+The original proposal targeted ILLIXR as the device-side testbed. On instructor
+feedback, full ILLIXR integration was deemed overly ambitious for the available
+timeline. We instead run the pipeline directly on a MacBook (device proxy) and
+Jetson Orin AGX (server) without the ILLIXR layer. This keeps the hardware
+setup close to the proposal while removing the integration overhead. Power
+measurements via \texttt{tegrastats} on the Jetson remain feasible with this setup.
+
+\textbf{Segmentation model: SegFormer-b0 instead of DeepLabv3+.}
+The proposal specified DeepLabv3+ following SAMOSA. SAMOSA's model was
+custom-trained on COCO-Stuff and is not publicly available, and no pretrained
+DeepLabv3+ trained on ADE20K exists off the shelf. We use SegFormer-b0
+pretrained on ADE20K, which provides equivalent pixel-level indoor surface
+classification (150 classes) with a comparable parameter count (3.75M).
+Since the segmentation model is offloaded to the server in Configs B--D,
+its specific architecture does not affect the offloading comparison.
+
+% -----------------------------------------------------------------------
+\section{Remaining Timeline}
+% -----------------------------------------------------------------------
+
+\begin{table}[H]
+\small\centering
+\caption{Remaining project milestones.}
+\label{tab:timeline}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Task} & \textbf{Target}\\
+\midrule
+\texttt{server.py} socket layer; device/server split working end-to-end & Apr 10\\
+Config B implemented and measured (offload segmentation)                & Apr 13\\
+Configs C and D implemented and measured                                & Apr 16\\
+ScanNet ground truth RIR comparison; audio quality metrics              & Apr 19\\
+Full experiment runs across all configs; latency and bandwidth tables   & Apr 21\\
+Results analysis; bottleneck identification; plots and tables           & Apr 24\\
+Final report and presentation                                           & Apr 28\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

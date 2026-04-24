@@ -17,6 +17,7 @@ for future offloading experiments.
 
 import argparse
 import os
+import socket as _socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from profiler import Profiler
@@ -55,6 +56,18 @@ def init_segmentation(image_path: str, cache_path: str, device: str | None = Non
     print(f"\nCache saved → {cache_path}")
 
 
+def _run_remote(server_addr: str, payload: dict) -> dict:
+    """Send payload to the offload server and return its response."""
+    from net_utils import send_msg, recv_msg
+    host, port_str = server_addr.rsplit(":", 1)
+    with _socket.create_connection((host, int(port_str)), timeout=120) as sock:
+        send_msg(sock, payload)
+        resp = recv_msg(sock)
+    if resp.get("error"):
+        raise RuntimeError(f"Server error: {resp['error']}")
+    return resp
+
+
 def run(
     scene_dir: str,
     image_path: str,
@@ -67,107 +80,219 @@ def run(
     max_order: int | None = None,
     device: str | None = None,
     ply_path: str | None = None,
+    server_addr: str | None = None,
+    offload_start: int | None = None,
+    offload_end: int | None = None,
 ):
     prof = Profiler()
+    offloading = bool(server_addr and offload_start is not None)
 
     print("=" * 52)
     print("  SAMOSA Acoustic Rendering Pipeline")
     print("=" * 52)
 
-    # ------------------------------------------------------------------
-    # Phase 1: Parallel perception modules
-    # ------------------------------------------------------------------
     geo = None
     seg_result = None
+    scene_type = None
+    preset = None
+    rir = None
+    t60 = None
 
-    def _run_shoebox():
-        nonlocal geo
-        with prof.timer("1. Shoebox estimation"):
-            if ply_path is not None:
-                geo = estimate_shoebox_from_ply(ply_path)
-            else:
-                geo = estimate_shoebox(scene_dir)
+    if offloading:
+        # --------------------------------------------------------------
+        # OFFLOAD PATH: headset runs stages 1..(offload_start-1),
+        # server runs offload_start..offload_end, headset finishes.
+        # Audio rendering (stage 5) always runs on headset.
+        # --------------------------------------------------------------
+        print(f"\n[Offload] Stages {offload_start}–{offload_end} → {server_addr}")
+        print(f"[Phase 1] Running local pre-offload stages...")
 
-    def _run_segmentation():
-        nonlocal seg_result
-        if samosa_mode:
-            # SAMOSA emulation: load SegFormer cache for material accuracy,
-            # run MobileNetV2 inference to match SAMOSA's ~10ms compute cost.
-            # run_mobilenet_timing() returns inference-only ms (preprocessed
-            # tensor cached, CUDA warmed up) — record that directly so we
-            # don't inflate the number with image loading overhead.
-            seg_result = load_segmentation_cache(seg_cache)
-            import torch
-            if device is None:
-                if torch.cuda.is_available():
-                    _device = "cuda"
-                elif torch.backends.mps.is_available():
-                    _device = "mps"
+        # Local stage 1 (shoebox) — only if we go before offload_start
+        if offload_start > 1:
+            with prof.timer("1. Shoebox estimation"):
+                if ply_path is not None:
+                    geo = estimate_shoebox_from_ply(ply_path)
                 else:
-                    _device = "cpu"
-            else:
-                _device = device
-            inference_ms = run_mobilenet_timing(image_path, _device)
-            prof._timings["2. Seg (MobileNetV2 timing, SAMOSA mode)"] = inference_ms
-        else:
+                    geo = estimate_shoebox(scene_dir)
+
+        # Local stage 2 (segmentation) — only if offload starts at 3+
+        if offload_start > 2:
             with prof.timer("2. Material segmentation"):
                 seg_result = classify_materials(image_path, method=seg_method, device=device)
 
-    mode_label = "SAMOSA emulation" if samosa_mode else seg_method
-    print(f"\n[Phase 1] Running perception modules in parallel (seg={mode_label})...")
+        # Local stage 3 (scene classification) — only if offload starts at 4
+        if offload_start > 3:
+            with prof.timer("3. Scene classification"):
+                scene_type, preset = classify_scene(
+                    material_distributions=seg_result.get("distributions"),
+                    room_dims=geo["room_dims"],
+                    best_materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
+                )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(_run_shoebox),
-            pool.submit(_run_segmentation),
-        ]
-        for f in as_completed(futures):
-            f.result()
+        # Build server payload
+        payload: dict = {
+            "stage_start": offload_start,
+            "stage_end":   offload_end,
+            "params": {
+                "fs":         fs,
+                "max_order":  max_order,
+                "seg_method": seg_method,
+                "device":     device,
+                "image_ext":  os.path.splitext(image_path)[1] or ".png",
+            },
+        }
 
-    w, l, h = geo["room_dims"]
-    print(f"  Shoebox:      {w:.2f} x {l:.2f} x {h:.2f} m")
-    print(f"  Source:       {[round(v, 2) for v in geo['source_pos']]}")
-    print(f"  Listener:    {[round(v, 2) for v in geo['listener_pos']]}")
-    print(f"  Floor mat:   {seg_result['floor']}")
-    print(f"  Wall mat:    {seg_result['walls']}")
-    print(f"  Ceiling mat: {seg_result['ceiling']}")
+        if offload_start == 1:
+            with open(ply_path, "rb") as f:
+                payload["ply_bytes"] = f.read()
+
+        if offload_start <= 2:
+            with open(image_path, "rb") as f:
+                payload["image_bytes"] = f.read()
+
+        if offload_start >= 2 and geo is not None:
+            payload["geo"] = {
+                k: list(v) if hasattr(v, "tolist") else v
+                for k, v in geo.items()
+                if k in ("room_dims", "source_pos", "listener_pos")
+            }
+
+        if offload_start >= 3 and seg_result is not None:
+            payload["seg"] = seg_result
+
+        if offload_start >= 4 and preset is not None:
+            payload["preset"] = preset
+
+        # Remote call — timer captures full headset-perceived round-trip
+        rtt_label = f"Server round-trip (stages {offload_start}–{offload_end})"
+        print(f"[Phase 2] Sending to server ({server_addr})...")
+        with prof.timer(rtt_label):
+            resp = _run_remote(server_addr, payload)
+
+        # Unpack server outputs
+        if offload_start == 1:
+            geo = resp["geo"]
+        if offload_end >= 2:
+            seg_result = resp["seg"]
+        if offload_end >= 3:
+            scene_type = resp["scene_type"]
+            preset = resp["preset"]
+        if offload_end >= 4:
+            import numpy as _np
+            rir = _np.asarray(resp["rir"])
+            t60 = resp["t60"]
+
+        # Remaining local stages after offload window
+        if offload_end < 3:
+            with prof.timer("3. Scene classification"):
+                scene_type, preset = classify_scene(
+                    material_distributions=seg_result.get("distributions"),
+                    room_dims=geo["room_dims"],
+                    best_materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
+                )
+
+        if offload_end < 4:
+            order = max_order if max_order is not None else preset["max_order"]
+            print("\n[Phase 3] Synthesising RIR (local)...")
+            with prof.timer("4. RIR synthesis"):
+                rir, t60 = compute_rir(
+                    room_dims=geo["room_dims"],
+                    materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
+                    source_pos=geo["source_pos"],
+                    listener_pos=geo["listener_pos"],
+                    fs=fs,
+                    max_order=order,
+                    distributions=seg_result.get("distributions"),
+                )
+        else:
+            order = max_order if max_order is not None else (preset or {}).get("max_order", "?")
+
+    else:
+        # --------------------------------------------------------------
+        # LOCAL PATH: original parallel execution, unchanged
+        # --------------------------------------------------------------
+        def _run_shoebox():
+            nonlocal geo
+            with prof.timer("1. Shoebox estimation"):
+                if ply_path is not None:
+                    geo = estimate_shoebox_from_ply(ply_path)
+                else:
+                    geo = estimate_shoebox(scene_dir)
+
+        def _run_segmentation():
+            nonlocal seg_result
+            if samosa_mode:
+                seg_result = load_segmentation_cache(seg_cache)
+                import torch
+                if device is None:
+                    if torch.cuda.is_available():
+                        _device = "cuda"
+                    elif torch.backends.mps.is_available():
+                        _device = "mps"
+                    else:
+                        _device = "cpu"
+                else:
+                    _device = device
+                inference_ms = run_mobilenet_timing(image_path, _device)
+                prof._timings["2. Seg (MobileNetV2 timing, SAMOSA mode)"] = inference_ms
+            else:
+                with prof.timer("2. Material segmentation"):
+                    seg_result = classify_materials(image_path, method=seg_method, device=device)
+
+        mode_label = "SAMOSA emulation" if samosa_mode else seg_method
+        print(f"\n[Phase 1] Running perception modules in parallel (seg={mode_label})...")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_run_shoebox), pool.submit(_run_segmentation)]
+            for f in as_completed(futures):
+                f.result()
+
+        with prof.timer("3. Scene classification"):
+            scene_type, preset = classify_scene(
+                material_distributions=seg_result.get("distributions"),
+                room_dims=geo["room_dims"],
+                best_materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
+            )
+
+        order = max_order if max_order is not None else preset["max_order"]
+        print(f"\n  Scene type:  {scene_type} (max_order={order})")
+        print("\n[Phase 2] Synthesising RIR...")
+
+        with prof.timer("4. RIR synthesis"):
+            rir, t60 = compute_rir(
+                room_dims=geo["room_dims"],
+                materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
+                source_pos=geo["source_pos"],
+                listener_pos=geo["listener_pos"],
+                fs=fs,
+                max_order=order,
+                distributions=seg_result.get("distributions"),
+            )
 
     # ------------------------------------------------------------------
-    # Phase 2: Scene classification (uses outputs from phase 1)
+    # Print geometry / material summary (both paths)
     # ------------------------------------------------------------------
-    with prof.timer("3. Scene classification"):
-        scene_type, preset = classify_scene(
-            material_distributions=seg_result.get("distributions"),
-            room_dims=geo["room_dims"],
-            best_materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
-        )
-
-    order = max_order if max_order is not None else preset["max_order"]
-    print(f"\n  Scene type:  {scene_type} (max_order={order})")
-
-    # ------------------------------------------------------------------
-    # Phase 3: RIR synthesis
-    # ------------------------------------------------------------------
-    print("\n[Phase 2] Synthesising RIR...")
-
-    with prof.timer("4. RIR synthesis"):
-        rir, t60 = compute_rir(
-            room_dims=geo["room_dims"],
-            materials={k: seg_result[k] for k in ("walls", "floor", "ceiling")},
-            source_pos=geo["source_pos"],
-            listener_pos=geo["listener_pos"],
-            fs=fs,
-            max_order=order,
-            distributions=seg_result.get("distributions"),
-        )
-
-    print(f"  RIR length:  {len(rir)} samples ({len(rir) / fs * 1000:.1f} ms)")
-    print(f"  T60:         {t60:.3f} s  (preset target: {preset['target_rt60']:.1f} s)")
+    if geo is not None:
+        w, l, h = geo["room_dims"]
+        print(f"  Shoebox:      {w:.2f} x {l:.2f} x {h:.2f} m")
+        print(f"  Source:       {[round(v, 2) for v in geo['source_pos']]}")
+        print(f"  Listener:    {[round(v, 2) for v in geo['listener_pos']]}")
+    if seg_result is not None:
+        print(f"  Floor mat:   {seg_result['floor']}")
+        print(f"  Wall mat:    {seg_result['walls']}")
+        print(f"  Ceiling mat: {seg_result['ceiling']}")
+    if scene_type is not None:
+        print(f"  Scene type:  {scene_type}")
+    if rir is not None:
+        print(f"\n  RIR length:  {len(rir)} samples ({len(rir) / fs * 1000:.1f} ms)")
+        print(f"  T60:         {t60:.3f} s")
+    if preset is not None and "target_rt60" in preset:
+        print(f"  (preset target: {preset['target_rt60']:.1f} s)")
 
     # ------------------------------------------------------------------
-    # Phase 4: Audio rendering
+    # Stage 5: Audio rendering (always local)
     # ------------------------------------------------------------------
-    print(f"\n[Phase 3] Rendering audio → {output_audio}")
+    print(f"\n[Phase {'3' if offloading else '3'}] Rendering audio → {output_audio}")
 
     with prof.timer("5. Audio rendering"):
         apply_rir(input_audio, rir, output_audio)
@@ -177,10 +302,23 @@ def run(
     # ------------------------------------------------------------------
     print(prof.summary())
 
+    if offloading:
+        server_timings = resp.get("timings", {})
+        server_total = sum(server_timings.values())
+        network_overhead = prof._timings[rtt_label] - server_total
+        rtt_ms = prof._timings[rtt_label]
+        print(f"  Server breakdown (stages {offload_start}–{offload_end}):")
+        for name, ms in server_timings.items():
+            print(f"    {name:<40s} {ms:7.1f} ms")
+        print(f"    {'Server total':<40s} {server_total:7.1f} ms")
+        print(f"    {'Network overhead':<40s} {network_overhead:7.1f} ms")
+        print(f"    (round-trip wall-clock:               {rtt_ms:7.1f} ms)")
+        print()
+
     return {
         "geometry":      geo,
-        "materials":     {k: seg_result[k] for k in ("walls", "floor", "ceiling")},
-        "distributions": seg_result.get("distributions"),
+        "materials":     {k: seg_result[k] for k in ("walls", "floor", "ceiling")} if seg_result else None,
+        "distributions": seg_result.get("distributions") if seg_result else None,
         "scene_type":    scene_type,
         "preset":        preset,
         "rir":           rir,
@@ -224,7 +362,28 @@ def main():
     parser.add_argument("--seg-cache", default="segmentation_cache.json",
                         help="Path to segmentation cache file (default: segmentation_cache.json)")
 
+    # Offloading flags
+    parser.add_argument("--server", default=None, metavar="HOST:PORT",
+                        help="Offload server address, e.g. 192.168.1.100:9000")
+    parser.add_argument("--offload", nargs=2, type=int, metavar=("START", "END"),
+                        default=None,
+                        help="Pipeline stage range to run on server (1-4). "
+                             "E.g. --offload 2 4 (Config C), --offload 1 4 (Config D)")
+
     args = parser.parse_args()
+
+    # Validate offload arguments
+    if args.offload is not None:
+        s, e = args.offload
+        if not (1 <= s <= e <= 4):
+            parser.error("--offload START END must satisfy 1 <= START <= END <= 4")
+        if s == 1 and args.ply is None:
+            parser.error("--offload 1 ... requires --ply "
+                         "(ScanNet scene dirs cannot be transferred over the network)")
+        if args.server is None:
+            parser.error("--offload requires --server HOST:PORT")
+        if args.samosa_mode:
+            parser.error("--samosa-mode is incompatible with --offload")
 
     # Auto-pick the first color frame from the scene dir if --image not given
     import glob as _glob
@@ -261,6 +420,9 @@ def main():
         max_order=args.max_order,
         device=args.device,
         ply_path=args.ply,
+        server_addr=args.server,
+        offload_start=args.offload[0] if args.offload else None,
+        offload_end=args.offload[1] if args.offload else None,
     )
 
 
