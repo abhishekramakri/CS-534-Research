@@ -59,9 +59,10 @@ def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
             temp_files.append(tmp.name)
             use_samosa = samosa_mode or params.get("samosa_mode", False)
             if use_samosa:
-                seg = classify_materials(tmp.name, method="heuristic", device=device)
-                inference_ms = run_mobilenet_timing(tmp.name, device)
-                prof._timings["2. Seg (MobileNetV3 timing, SAMOSA mode)"] = inference_ms
+                with prof.timer("2. Seg (SAMOSA mode)"):
+                    seg = classify_materials(tmp.name, method="heuristic", device=device)
+                    inference_ms = run_mobilenet_timing(tmp.name, device)
+                prof._timings["   MobileNetV3 inference"] = inference_ms
             else:
                 with prof.timer("2. Material segmentation"):
                     seg = classify_materials(
