@@ -39,6 +39,7 @@ _TSTAT_LABELS = [
 class PowerMonitor:
     def __init__(self, interval_ms: int | None = None):
         self._tstat_proc = None   # only used for tegrastats backend
+        self._tstat_sudo = False  # set by _detect() if sudo is needed
         self._reader, self.backend = self._detect()
         if interval_ms is None:
             if self.backend in ("nvidia-smi (GPU)",) or self.backend.startswith("macos"):
@@ -103,18 +104,12 @@ class PowerMonitor:
                     self._jetson_paths = readable
                     return self._read_jetson, f"jetson-ina3221 ({len(readable)} ch)"
 
-        # Jetson tegrastats — streaming subprocess (works when sysfs is absent)
-        # Requires sudo on most Jetson configurations.
+        # Jetson tegrastats — detect by binary presence (avoids requiretty issues
+        # when spawning sudo from a non-interactive subprocess).
         try:
-            import subprocess, re
-            proc = subprocess.Popen(
-                ["sudo", "tegrastats", "--interval", "200"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            )
-            line = proc.stdout.readline()
-            proc.terminate()
-            proc.wait(timeout=2)
-            if line and self._parse_tegrastats(line) is not None:
+            import shutil, os as _os
+            if shutil.which("tegrastats"):
+                self._tstat_sudo = (_os.getuid() != 0)
                 return None, "tegrastats (Jetson board)"
         except Exception:
             pass
@@ -223,9 +218,12 @@ class PowerMonitor:
         if self.backend.startswith("tegrastats"):
             import subprocess
             interval_ms = max(100, int(self._interval * 1000))
+            cmd = ["sudo", "tegrastats", "--interval", str(interval_ms)] \
+                  if self._tstat_sudo else ["tegrastats", "--interval", str(interval_ms)]
             self._tstat_proc = subprocess.Popen(
-                ["sudo", "tegrastats", "--interval", str(interval_ms)],
+                cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True,
             )
             self._thread = threading.Thread(target=self._poll_tegrastats, daemon=True)
         else:
@@ -237,10 +235,19 @@ class PowerMonitor:
         self._stop_evt.set()
         if self._tstat_proc is not None:
             try:
-                self._tstat_proc.terminate()
+                import os, signal
+                os.killpg(self._tstat_proc.pid, signal.SIGTERM)
                 self._tstat_proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    import os, signal
+                    os.killpg(self._tstat_proc.pid, signal.SIGKILL)
+                except Exception:
+                    self._tstat_proc.kill()
+                try:
+                    self._tstat_proc.wait(timeout=1)
+                except Exception:
+                    pass
             self._tstat_proc = None
         if self._thread:
             self._thread.join(timeout=3)

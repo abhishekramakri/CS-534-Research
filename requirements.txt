@@ -5,7 +5,6 @@ scipy
 soundfile
 
 # Shoebox estimation (PLY loading)
-open3d
 trimesh
 
 # Material segmentation (SegFormer)
