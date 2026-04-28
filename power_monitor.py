@@ -329,7 +329,7 @@ class PowerMonitor:
         """
         import re
         _pat = re.compile(
-            r'(?:Combined Power \(CPU \+ GPU \+ DRAM\)|Package Power):\s*(\d+(?:\.\d+)?)\s*mW',
+            r'(?:Combined Power \([^)]+\)|Package Power):\s*(\d+(?:\.\d+)?)\s*mW',
             re.IGNORECASE,
         )
         try:
