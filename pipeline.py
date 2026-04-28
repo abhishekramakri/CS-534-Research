@@ -343,15 +343,26 @@ def run(
         print("=" * 52)
         print()
 
+    _server_breakdown = None
+    if offloading:
+        _server_breakdown = {
+            "timings":            server_timings,
+            "server_total_ms":    server_total,
+            "network_overhead_ms": network_overhead,
+            "rtt_ms":             rtt_ms,
+        }
+
     return {
-        "geometry":      geo,
-        "materials":     {k: seg_result[k] for k in ("walls", "floor", "ceiling")} if seg_result else None,
-        "distributions": seg_result.get("distributions") if seg_result else None,
-        "scene_type":    scene_type,
-        "preset":        preset,
-        "rir":           rir,
-        "t60":           t60,
-        "timings":       prof.timings,
+        "geometry":        geo,
+        "materials":       {k: seg_result[k] for k in ("walls", "floor", "ceiling")} if seg_result else None,
+        "distributions":   seg_result.get("distributions") if seg_result else None,
+        "scene_type":      scene_type,
+        "preset":          preset,
+        "rir":             rir,
+        "t60":             t60,
+        "timings":         prof.timings,
+        "power":           {"client": client_power, "server": server_power},
+        "server_breakdown": _server_breakdown,
     }
 
 
