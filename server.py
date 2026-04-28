@@ -18,7 +18,14 @@ from acoustics import compute_rir
 from net_utils import recv_msg, send_msg
 from profiler import Profiler
 from scene_classifier import classify_scene
-from segmentation import classify_materials, run_mobilenet_timing
+import io
+from PIL import Image as _PIL_Image
+from segmentation import (
+    classify_materials,
+    run_mobilenet_timing,
+    run_mobilenet_timing_from_pil,
+    FALLBACK_MATERIALS,
+)
 from shoebox import estimate_shoebox_from_ply
 
 
@@ -59,9 +66,12 @@ def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
             temp_files.append(tmp.name)
             use_samosa = samosa_mode or params.get("samosa_mode", False)
             if use_samosa:
+                # Decode once in memory — avoids reading the temp file twice.
+                pil_img = _PIL_Image.open(io.BytesIO(req["image_bytes"])).convert("RGB")
+                seg = {**FALLBACK_MATERIALS,
+                       "distributions": {s: {m: 1.0} for s, m in FALLBACK_MATERIALS.items()}}
                 with prof.timer("2. Seg (SAMOSA mode)"):
-                    seg = classify_materials(tmp.name, method="heuristic", device=device)
-                    inference_ms = run_mobilenet_timing(tmp.name, device)
+                    inference_ms = run_mobilenet_timing_from_pil(pil_img, device)
                 prof._timings["   MobileNetV3 inference"] = inference_ms
             else:
                 with prof.timer("2. Material segmentation"):
@@ -135,7 +145,8 @@ def _warmup(device: str, samosa_mode: bool) -> None:
         _Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(tmp.name)
         tmp.close()
         if samosa_mode:
-            run_mobilenet_timing(tmp.name, device)
+            pil_img = _PIL_Image.open(tmp.name).convert("RGB")
+            run_mobilenet_timing_from_pil(pil_img, device)
         else:
             classify_materials(tmp.name, method="segformer", device=device)
     finally:

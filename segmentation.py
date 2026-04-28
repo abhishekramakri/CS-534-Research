@@ -262,62 +262,82 @@ def classify_materials(
 _mobilenet_cache: dict = {}
 
 
-def run_mobilenet_timing(image_path: str, device: str) -> float:
-    """
-    Run DeepLabV3 with MobileNetV3-Large backbone and return inference-only ms.
-    The output is discarded — this exists to approximate the compute profile of
-    SAMOSA's DeepLabv3+ MobileNetV2 segmentation module (full-resolution dense
-    prediction, MobileNet backbone), without needing to retrain on ADE20K.
-
-    Both the model and the preprocessed tensor are cached for the process
-    lifetime.  Image loading and preprocessing are NOT included in the
-    returned time.
-    """
-    import time
+def _ensure_mobilenet_loaded(device: str) -> None:
+    """Load and warm MobileNetV3 into the module cache if not already done."""
     import torch
     import torchvision.transforms as T
     from torchvision.models.segmentation import (
         deeplabv3_mobilenet_v3_large,
         DeepLabV3_MobileNet_V3_Large_Weights,
     )
+    if _mobilenet_cache.get("device") == device:
+        return
+    model = deeplabv3_mobilenet_v3_large(
+        weights=DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
+    )
+    model.to(device).eval()
+    dummy = torch.zeros(1, 3, 520, 520, device=device)
+    with torch.no_grad():
+        model(dummy)
+    _mobilenet_cache["model"] = model
+    _mobilenet_cache["device"] = device
+    _mobilenet_cache["transform"] = T.Compose([
+        T.Resize((520, 520)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    cache_key = (image_path, device)
 
-    if _mobilenet_cache.get("device") != device:
-        model = deeplabv3_mobilenet_v3_large(
-            weights=DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
-        )
-        model.to(device).eval()
-        # Warmup pass so kernels are compiled before the first timed run
-        dummy = torch.zeros(1, 3, 520, 520, device=device)
-        with torch.no_grad():
-            model(dummy)
-        _mobilenet_cache["model"] = model
-        _mobilenet_cache["device"] = device
-        _mobilenet_cache["transform"] = T.Compose([
-            T.Resize((520, 520)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-    # Cache the preprocessed tensor at full resolution
-    if _mobilenet_cache.get("tensor_key") != cache_key:
-        img = Image.open(image_path).convert("RGB")
-        tensor = _mobilenet_cache["transform"](img).unsqueeze(0).to(device)
-        _mobilenet_cache["tensor"] = tensor
-        _mobilenet_cache["tensor_key"] = cache_key
-
-    model = _mobilenet_cache["model"]
-    tensor = _mobilenet_cache["tensor"]
-
+def _mobilenet_forward(pil_img: Image.Image, device: str) -> float:
+    """Preprocess pil_img and run one timed forward pass. Returns ms."""
+    import time
+    import torch
+    _ensure_mobilenet_loaded(device)
+    tensor = _mobilenet_cache["transform"](pil_img).unsqueeze(0).to(device)
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        _ = model(tensor)
+        _ = _mobilenet_cache["model"](tensor)
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     return (time.perf_counter() - t0) * 1000
+
+
+def run_mobilenet_timing(image_path: str, device: str) -> float:
+    """
+    Run DeepLabV3-MobileNetV3 and return inference-only ms.
+    Image loading and preprocessing are NOT included in the returned time.
+    """
+    # Cache the preprocessed tensor by (path, device) so repeated local calls are fast.
+    cache_key = (image_path, device)
+    _ensure_mobilenet_loaded(device)
+    if _mobilenet_cache.get("tensor_key") != cache_key:
+        img = Image.open(image_path).convert("RGB")
+        import torch
+        tensor = _mobilenet_cache["transform"](img).unsqueeze(0).to(device)
+        _mobilenet_cache["tensor"] = tensor
+        _mobilenet_cache["tensor_key"] = cache_key
+
+    import time, torch
+    tensor = _mobilenet_cache["tensor"]
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        _ = _mobilenet_cache["model"](tensor)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    return (time.perf_counter() - t0) * 1000
+
+
+def run_mobilenet_timing_from_pil(pil_img: Image.Image, device: str) -> float:
+    """
+    Same as run_mobilenet_timing but accepts an already-decoded PIL image.
+    Preprocessing (resize + normalize + GPU transfer) IS included — use this
+    on the server where the image arrives as bytes and disk I/O should be avoided.
+    """
+    return _mobilenet_forward(pil_img, device)
 
 
 def save_segmentation_cache(result: dict, cache_path: str):
