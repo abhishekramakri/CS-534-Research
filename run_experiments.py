@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
 run_experiments.py
-Runs all 4 configs × 2 modes (normal / SAMOSA) for every PLY+image pair
-in the testing directory. Writes results to results/metrics.csv.
+Runs configs × modes (normal / SAMOSA) for every scene and writes results to CSV.
+
+Two scene sources can be combined in one run:
+  1. PLY+image pairs in testing/   → configs A B C D
+  2. ScanNet scene directories     → configs A B C only (D requires PLY transfer)
 
 Usage:
+    # PLY scenes only
     python run_experiments.py --server 192.168.50.91:9001
+
+    # ScanNet scenes only
+    python run_experiments.py --server 192.168.50.91:9001 --scannet-dir /path/to/scannet
+
+    # Both
+    python run_experiments.py --server 192.168.50.91:9001 --scannet-dir /path/to/scannet
 
 The server only needs to be started once (no --samosa-mode flag needed):
     python server.py --port 9001 --device cuda
-
-The script sends samosa_mode=True in the request payload for SAMOSA runs,
-so no server restart is required.
 """
 
 import argparse
@@ -31,15 +38,16 @@ CONFIGS = {
     "D": {"offload_start": 1,    "offload_end": 4},
 }
 
-TESTING_DIR  = Path("testing")
-RESULTS_DIR  = Path("results")
-AUDIO_INPUT  = "audio/test.wav"
-N_RUNS       = 3     # recorded runs per combination
-N_WARMUP     = 1     # discarded warmup runs per combination
+TESTING_DIR      = Path("testing")
+RESULTS_DIR      = Path("results")
+AUDIO_INPUT      = "audio/test.wav"
+N_RUNS           = 3     # recorded runs per combination
+N_WARMUP         = 1     # discarded warmup runs per combination
+SCANNET_CONFIGS  = ["A", "B", "C"]   # D excluded — requires PLY transfer to server
 
 
 def find_pairs(testing_dir: Path) -> list[tuple[str, Path, Path]]:
-    """Return [(scene_name, ply_path, image_path)] for each matched pair."""
+    """Return [(scene_name, ply_path, image_path)] for each matched PLY+image pair."""
     plys   = {p.stem: p for p in sorted(testing_dir.glob("*.ply"))}
     images = {}
     for ext in ("*.png", "*.jpg", "*.jpeg"):
@@ -48,6 +56,37 @@ def find_pairs(testing_dir: Path) -> list[tuple[str, Path, Path]]:
                 images[img.stem] = img
     return [(name, plys[name], images[name])
             for name in sorted(plys) if name in images]
+
+
+def find_scannet_scenes(scannet_dir: Path) -> list[tuple[str, Path, Path]]:
+    """
+    Return [(scene_name, scene_dir, image_path)] for each ScanNet scene.
+    Looks for color frames in color/, rgb/, frames/color/, or the scene dir itself.
+    Picks the middle frame as the representative image.
+    """
+    results = []
+    for scene_path in sorted(scannet_dir.iterdir()):
+        if not scene_path.is_dir():
+            continue
+        image_path = None
+        for subdir in ("color", "rgb", "frames/color", "images"):
+            candidate = scene_path / subdir
+            if candidate.is_dir():
+                frames = sorted(candidate.glob("*.jpg")) + sorted(candidate.glob("*.png"))
+                if frames:
+                    image_path = frames[len(frames) // 2]
+                    break
+        if image_path is None:
+            for ext in ("*.jpg", "*.png", "*.jpeg"):
+                frames = sorted(scene_path.glob(ext))
+                if frames:
+                    image_path = frames[len(frames) // 2]
+                    break
+        if image_path is None:
+            print(f"  [warn] No images found in {scene_path.name}, skipping")
+            continue
+        results.append((scene_path.name, scene_path, image_path))
+    return results
 
 
 def get_timing(timings: dict, *prefixes: str) -> float | None:
@@ -59,10 +98,15 @@ def get_timing(timings: dict, *prefixes: str) -> float | None:
     return None
 
 
-def run_one(scene: str, ply: Path, image: Path, config: str,
+def run_one(scene: str, ply: Path | None, image: Path, config: str,
             samosa: bool, server: str | None, seg_cache: str,
-            run_idx: int) -> dict:
-    """Run the pipeline for one combination and return a flat metrics dict."""
+            run_idx: int, scene_dir: Path | None = None) -> dict:
+    """Run the pipeline for one combination and return a flat metrics dict.
+
+    ply and scene_dir are mutually exclusive sources for geometry:
+      - ply       : pre-built mesh (testing/ pairs, all configs)
+      - scene_dir : ScanNet directory (configs A/B/C only; D excluded)
+    """
     import pipeline as pl
 
     cfg = CONFIGS[config]
@@ -73,11 +117,11 @@ def run_one(scene: str, ply: Path, image: Path, config: str,
     output_wav = str(RESULTS_DIR / f"{scene}_cfg{config}_{'samosa' if samosa else 'normal'}_r{run_idx}.wav")
 
     result = pl.run(
-        scene_dir     = str(TESTING_DIR / scene),   # fallback; unused when ply given
+        scene_dir     = str(scene_dir) if scene_dir else str(TESTING_DIR / scene),
         image_path    = str(image),
         input_audio   = AUDIO_INPUT,
         output_audio  = output_wav,
-        ply_path      = str(ply),
+        ply_path      = str(ply) if ply else None,
         seg_method    = "segformer",
         samosa_mode   = samosa and (offload_start is None),  # local SAMOSA only for Config A
         seg_cache     = seg_cache,
@@ -133,14 +177,15 @@ def run_one(scene: str, ply: Path, image: Path, config: str,
     return row
 
 
-def init_seg_caches(pairs: list, server: str | None) -> dict[str, str]:
+def init_seg_caches(scenes: list[tuple[str, Path | None, Path]], server: str | None) -> dict[str, str]:
     """
     Pre-generate segmentation caches for Config A SAMOSA mode.
+    Accepts [(scene_name, ply_or_None, image_path)].
     Returns {scene_name: cache_path}.
     """
     import pipeline as pl
     caches = {}
-    for scene, ply, image in pairs:
+    for scene, _, image in scenes:
         cache_path = str(RESULTS_DIR / f"{scene}_seg_cache.json")
         if not os.path.exists(cache_path):
             print(f"  [init-seg] Generating cache for {scene}...")
@@ -155,7 +200,14 @@ def main():
                         help="Server HOST:PORT (default: 192.168.50.91:9001)")
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS.keys()),
                         choices=list(CONFIGS.keys()),
-                        help="Configs to run (default: A B C D)")
+                        help="Configs for PLY scenes (default: A B C D)")
+    parser.add_argument("--scannet-dir", default=None, metavar="PATH",
+                        help="Root directory of ScanNet scenes (each subdirectory is one scene)")
+    parser.add_argument("--scannet-configs", nargs="+", default=SCANNET_CONFIGS,
+                        choices=list(CONFIGS.keys()),
+                        help=f"Configs for ScanNet scenes (default: {' '.join(SCANNET_CONFIGS)})")
+    parser.add_argument("--no-ply", action="store_true",
+                        help="Skip PLY+image pair scenes from testing/")
     parser.add_argument("--no-samosa", action="store_true",
                         help="Skip SAMOSA mode runs")
     parser.add_argument("--runs",    type=int, default=N_RUNS,
@@ -167,29 +219,58 @@ def main():
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(exist_ok=True)
-
-    pairs = find_pairs(TESTING_DIR)
-    if not pairs:
-        print("No PLY+image pairs found in testing/", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Found {len(pairs)} scene(s): {[p[0] for p in pairs]}")
     modes = [False, True] if not args.no_samosa else [False]
 
-    # Pre-generate seg caches (needed for Config A + SAMOSA)
-    if not args.no_samosa and "A" in args.configs:
-        print("\nInitialising segmentation caches for SAMOSA mode...")
-        seg_caches = init_seg_caches(pairs, args.server)
-    else:
-        seg_caches = {scene: f"results/{scene}_seg_cache.json" for scene, *_ in pairs}
+    # --- Collect scenes from both sources ---
+    # Each entry: (scene_name, ply_or_None, image, allowed_configs, scene_dir_or_None)
+    all_scenes: list[tuple[str, Path | None, Path, list[str], Path | None]] = []
 
-    # Build full run list
+    if not args.no_ply:
+        pairs = find_pairs(TESTING_DIR)
+        if not pairs:
+            print("No PLY+image pairs found in testing/", file=sys.stderr)
+            if args.scannet_dir is None:
+                sys.exit(1)
+        else:
+            print(f"PLY scenes ({len(pairs)}): {[p[0] for p in pairs]}")
+            for name, ply, img in pairs:
+                all_scenes.append((name, ply, img, args.configs, None))
+
+    if args.scannet_dir:
+        scannet_scenes = find_scannet_scenes(Path(args.scannet_dir))
+        if not scannet_scenes:
+            print(f"No ScanNet scenes found in {args.scannet_dir}", file=sys.stderr)
+        else:
+            # Enforce configs A/B/C — D requires PLY transfer which ScanNet can't do
+            valid_sn_configs = [c for c in args.scannet_configs if c != "D"]
+            if "D" in args.scannet_configs:
+                print("  [warn] Config D excluded for ScanNet (requires PLY transfer)")
+            print(f"ScanNet scenes ({len(scannet_scenes)}): {[s[0] for s in scannet_scenes]}")
+            for name, sdir, img in scannet_scenes:
+                all_scenes.append((name, None, img, valid_sn_configs, sdir))
+
+    if not all_scenes:
+        print("No scenes to run.", file=sys.stderr)
+        sys.exit(1)
+
+    # Pre-generate seg caches (needed for Config A + SAMOSA)
+    seg_caches: dict[str, str] = {}
+    if not args.no_samosa:
+        needs_cache = [(name, ply, img) for name, ply, img, cfgs, _ in all_scenes if "A" in cfgs]
+        if needs_cache:
+            print("\nInitialising segmentation caches for SAMOSA mode...")
+            seg_caches = init_seg_caches(needs_cache, args.server)
+    # Fallback paths for scenes that don't need a cache (won't be used)
+    for name, *_ in all_scenes:
+        seg_caches.setdefault(name, f"results/{name}_seg_cache.json")
+
+    # Build full run list: (scene, ply, image, config, samosa, r, scene_dir)
     runs = []
-    for scene, ply, image in pairs:
-        for config in args.configs:
+    for name, ply, img, cfgs, sdir in all_scenes:
+        for config in cfgs:
             for samosa in modes:
                 for r in range(args.warmup + args.runs):
-                    runs.append((scene, ply, image, config, samosa, r))
+                    runs.append((name, ply, img, config, samosa, r, sdir))
 
     total = len(runs)
     print(f"\nTotal runs: {total}  ({args.warmup} warmup + {args.runs} recorded each)\n")
@@ -211,10 +292,11 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-        for i, (scene, ply, image, config, samosa, r) in enumerate(runs):
+        for i, (scene, ply, image, config, samosa, r, sdir) in enumerate(runs):
             is_warmup = r < args.warmup
-            recorded_r = r - args.warmup  # negative for warmup runs
-            label = (f"[{i+1}/{total}] {scene} Config {config} "
+            recorded_r = r - args.warmup
+            src_label = "ScanNet" if sdir else "PLY"
+            label = (f"[{i+1}/{total}] {scene} ({src_label}) Config {config} "
                      f"{'SAMOSA' if samosa else 'normal':6s} "
                      f"{'(warmup)' if is_warmup else f'run {recorded_r+1}'}")
             print(label, end=" ... ", flush=True)
@@ -222,7 +304,8 @@ def main():
             t0 = time.perf_counter()
             try:
                 row = run_one(scene, ply, image, config, samosa,
-                              args.server, seg_caches[scene], recorded_r)
+                              args.server, seg_caches[scene], recorded_r,
+                              scene_dir=sdir)
                 elapsed = time.perf_counter() - t0
                 print(f"{row['client_total_ms']:.0f} ms  ({elapsed:.1f}s wall)")
 
