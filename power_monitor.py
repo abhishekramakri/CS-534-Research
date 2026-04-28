@@ -245,7 +245,7 @@ class PowerMonitor:
                 ["sudo", "powermetrics", "--samplers", "cpu_power",
                  "-i", str(interval_ms)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                start_new_session=True,
+                # No start_new_session — sudo needs the TTY credential cache on macOS
             )
             self._thread = threading.Thread(target=self._poll_powermetrics, daemon=True)
         else:
@@ -255,24 +255,33 @@ class PowerMonitor:
     def stop(self, duration_ms: float | None = None) -> dict | None:
         """Stop polling. Returns stats dict or None if no samples collected."""
         self._stop_evt.set()
-        for attr in ("_tstat_proc", "_pmx_proc"):
-            proc = getattr(self, attr, None)
-            if proc is not None:
+        if self._tstat_proc is not None:
+            try:
+                import os, signal
+                os.killpg(self._tstat_proc.pid, signal.SIGTERM)
+                self._tstat_proc.wait(timeout=2)
+            except Exception:
                 try:
                     import os, signal
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=2)
+                    os.killpg(self._tstat_proc.pid, signal.SIGKILL)
                 except Exception:
-                    try:
-                        import os, signal
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        proc.kill()
-                    try:
-                        proc.wait(timeout=1)
-                    except Exception:
-                        pass
-                setattr(self, attr, None)
+                    self._tstat_proc.kill()
+                try:
+                    self._tstat_proc.wait(timeout=1)
+                except Exception:
+                    pass
+            self._tstat_proc = None
+        if self._pmx_proc is not None:
+            try:
+                self._pmx_proc.terminate()
+                self._pmx_proc.wait(timeout=2)
+            except Exception:
+                self._pmx_proc.kill()
+                try:
+                    self._pmx_proc.wait(timeout=1)
+                except Exception:
+                    pass
+            self._pmx_proc = None
         if self._thread:
             self._thread.join(timeout=3)
         if not self._samples:
