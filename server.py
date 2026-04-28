@@ -123,7 +123,30 @@ def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
     return resp
 
 
+def _warmup(device: str, samosa_mode: bool) -> None:
+    """Pre-load and warm the segmentation model before accepting connections."""
+    import numpy as np
+    from PIL import Image as _Image
+
+    print("[server] Warming up segmentation model...", flush=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    try:
+        _Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(tmp.name)
+        tmp.close()
+        if samosa_mode:
+            run_mobilenet_timing(tmp.name, device)
+        else:
+            classify_materials(tmp.name, method="segformer", device=device)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    print("[server] Model ready.", flush=True)
+
+
 def serve(host: str, port: int, device: str, samosa_mode: bool = False) -> None:
+    _warmup(device, samosa_mode)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
