@@ -106,14 +106,25 @@ class PowerMonitor:
         # Jetson tegrastats — streaming subprocess (works when sysfs is absent)
         # Requires sudo on most Jetson configurations.
         try:
-            import subprocess, re
+            import os, signal, subprocess, re
             proc = subprocess.Popen(
                 ["sudo", "tegrastats", "--interval", "200"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True,  # makes proc.pid == pgid, so killpg kills tegrastats too
             )
             line = proc.stdout.readline()
-            proc.terminate()
-            proc.wait(timeout=2)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
             if line and self._parse_tegrastats(line) is not None:
                 return None, "tegrastats (Jetson board)"
         except Exception:
@@ -226,6 +237,7 @@ class PowerMonitor:
             self._tstat_proc = subprocess.Popen(
                 ["sudo", "tegrastats", "--interval", str(interval_ms)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True,
             )
             self._thread = threading.Thread(target=self._poll_tegrastats, daemon=True)
         else:
@@ -237,10 +249,19 @@ class PowerMonitor:
         self._stop_evt.set()
         if self._tstat_proc is not None:
             try:
-                self._tstat_proc.terminate()
+                import os, signal
+                os.killpg(self._tstat_proc.pid, signal.SIGTERM)
                 self._tstat_proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    import os, signal
+                    os.killpg(self._tstat_proc.pid, signal.SIGKILL)
+                except Exception:
+                    self._tstat_proc.kill()
+                try:
+                    self._tstat_proc.wait(timeout=1)
+                except Exception:
+                    pass
             self._tstat_proc = None
         if self._thread:
             self._thread.join(timeout=3)
