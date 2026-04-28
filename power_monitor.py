@@ -70,13 +70,28 @@ class PowerMonitor:
         except Exception:
             pass
 
-        # Jetson INA3221 sysfs (board-level power)
-        paths = sorted(glob.glob(
-            "/sys/bus/i2c/drivers/ina3221/*/hwmon/hwmon*/power*_input"
-        ))
-        if paths:
-            self._jetson_paths = paths
-            return self._read_jetson, f"jetson-ina3221 ({len(paths)} ch)"
+        # Jetson INA3221 sysfs (board-level power) — try several path variants
+        # across JetPack versions and kernel configurations
+        _JETSON_GLOBS = [
+            "/sys/bus/i2c/drivers/ina3221/*/hwmon/hwmon*/power*_input",
+            "/sys/bus/platform/drivers/ina3221/*/hwmon/hwmon*/power*_input",
+            "/sys/bus/i2c/devices/*/hwmon/hwmon*/power*_input",
+            "/sys/class/hwmon/hwmon*/power*_input",  # broadest fallback
+        ]
+        for pattern in _JETSON_GLOBS:
+            paths = sorted(glob.glob(pattern))
+            if paths:
+                # Filter out zero-read paths (some hwmon entries always return 0)
+                readable = []
+                for p in paths:
+                    try:
+                        if int(open(p).read().strip()) > 0:
+                            readable.append(p)
+                    except OSError:
+                        pass
+                if readable:
+                    self._jetson_paths = readable
+                    return self._read_jetson, f"jetson-ina3221 ({len(readable)} ch)"
 
         # macOS — AppleSmartBattery via ioreg (no sudo, battery mode only)
         import sys
