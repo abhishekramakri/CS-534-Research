@@ -81,16 +81,24 @@ class PowerMonitor:
         # macOS — AppleSmartBattery via ioreg (no sudo, battery mode only)
         import sys
         if sys.platform == "darwin":
-            try:
-                import subprocess
-                out = subprocess.run(
-                    ["ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
-                    capture_output=True, text=True, timeout=3,
-                ).stdout
-                if '"Voltage"' in out and '"InstantAmperage"' in out:
-                    return self._read_macos_battery, "macos-ioreg (battery, on-battery only)"
-            except Exception:
-                pass
+            import subprocess
+            _CANDIDATES = [
+                ["/usr/sbin/ioreg", "-r", "-c", "AppleSmartBattery", "-d", "1"],
+                ["ioreg", "-r", "-c", "AppleSmartBattery", "-d", "1"],
+                ["/usr/sbin/ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
+                ["ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
+                ["/usr/sbin/ioreg", "-rn", "AppleSmartBattery"],
+            ]
+            for cmd in _CANDIDATES:
+                try:
+                    out = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=3,
+                    ).stdout
+                    if '"Voltage"' in out:
+                        self._ioreg_cmd = cmd
+                        return self._read_macos_battery, "macos-ioreg (battery, on-battery only)"
+                except Exception:
+                    continue
 
         return None, "unavailable"
 
@@ -122,10 +130,12 @@ class PowerMonitor:
         import subprocess, re
         try:
             out = subprocess.run(
-                ["ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
-                capture_output=True, text=True, timeout=2,
+                self._ioreg_cmd, capture_output=True, text=True, timeout=2,
             ).stdout
-            amps_m = re.search(r'"InstantAmperage"\s*=\s*(\d+)', out)
+            # Try key names used across macOS versions / Apple Silicon
+            amps_m = (re.search(r'"InstantAmperage"\s*=\s*(\d+)', out)
+                      or re.search(r'"Amperage"\s*=\s*(-?\d+)', out)
+                      or re.search(r'"Current"\s*=\s*(-?\d+)', out))
             volts_m = re.search(r'"Voltage"\s*=\s*(\d+)', out)
             if not (amps_m and volts_m):
                 return None
@@ -159,6 +169,8 @@ class PowerMonitor:
     # Public API
     # ------------------------------------------------------------------
     def start(self):
+        if self._reader is None:
+            return
         self._samples.clear()
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._poll, daemon=True)
