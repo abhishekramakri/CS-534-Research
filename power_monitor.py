@@ -3,14 +3,14 @@ power_monitor.py
 Background-thread power sampler with auto-detecting backends.
 
 Backends tried in order:
-  1. pynvml      — NVIDIA GPU via NVML (no subprocess, fast)
-  2. nvidia-smi  — NVIDIA GPU via subprocess (fallback)
-  3. jetson      — Jetson INA3221 sysfs (board-level, several path variants)
-  4. tegrastats  — Jetson tegrastats streaming process (fallback if no sysfs)
-  5. macos       — Apple Silicon/Intel Mac via ioreg AppleSmartBattery
-                   NOTE: only produces readings when running on battery
-                   (unplugged). Returns None samples when plugged in.
-  6. None        — unsupported platform
+  1. pynvml             — NVIDIA GPU via NVML (no subprocess, fast)
+  2. nvidia-smi         — NVIDIA GPU via subprocess (fallback)
+  3. jetson             — Jetson INA3221 sysfs (board-level, several path variants)
+  4. tegrastats         — Jetson tegrastats streaming process (fallback if no sysfs)
+  5. macos-powermetrics — Apple Silicon/Intel via sudo powermetrics (works plugged in)
+  6. macos-ioreg        — Apple Silicon/Intel via ioreg AppleSmartBattery
+                         NOTE: only produces readings when running on battery.
+  7. None               — unsupported platform
 
 Usage:
     mon = PowerMonitor()
@@ -40,6 +40,7 @@ class PowerMonitor:
     def __init__(self, interval_ms: int | None = None):
         self._tstat_proc = None   # only used for tegrastats backend
         self._tstat_sudo = False  # set by _detect() if sudo is needed
+        self._pmx_proc   = None   # only used for macos-powermetrics backend
         self._reader, self.backend = self._detect()
         if interval_ms is None:
             if self.backend in ("nvidia-smi (GPU)",) or self.backend.startswith("macos"):
@@ -53,7 +54,9 @@ class PowerMonitor:
 
     @property
     def available(self) -> bool:
-        return self._reader is not None or self.backend.startswith("tegrastats")
+        return (self._reader is not None
+                or self.backend.startswith("tegrastats")
+                or self.backend == "macos-powermetrics")
 
     # ------------------------------------------------------------------
     # Backend detection
@@ -114,8 +117,17 @@ class PowerMonitor:
         except Exception:
             pass
 
-        # macOS — AppleSmartBattery via ioreg (no sudo, battery mode only)
+        # macOS powermetrics — accurate SoC power, works plugged in or on battery
         import sys
+        if sys.platform == "darwin":
+            try:
+                import shutil
+                if shutil.which("powermetrics"):
+                    return None, "macos-powermetrics"
+            except Exception:
+                pass
+
+        # macOS — AppleSmartBattery via ioreg fallback (battery-only)
         if sys.platform == "darwin":
             import subprocess
             _CANDIDATES = [
@@ -226,6 +238,16 @@ class PowerMonitor:
                 start_new_session=True,
             )
             self._thread = threading.Thread(target=self._poll_tegrastats, daemon=True)
+        elif self.backend == "macos-powermetrics":
+            import subprocess
+            interval_ms = max(200, int(self._interval * 1000))
+            self._pmx_proc = subprocess.Popen(
+                ["sudo", "powermetrics", "--samplers", "cpu_power",
+                 "-i", str(interval_ms)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True,
+            )
+            self._thread = threading.Thread(target=self._poll_powermetrics, daemon=True)
         else:
             self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
@@ -233,22 +255,24 @@ class PowerMonitor:
     def stop(self, duration_ms: float | None = None) -> dict | None:
         """Stop polling. Returns stats dict or None if no samples collected."""
         self._stop_evt.set()
-        if self._tstat_proc is not None:
-            try:
-                import os, signal
-                os.killpg(self._tstat_proc.pid, signal.SIGTERM)
-                self._tstat_proc.wait(timeout=2)
-            except Exception:
+        for attr in ("_tstat_proc", "_pmx_proc"):
+            proc = getattr(self, attr, None)
+            if proc is not None:
                 try:
                     import os, signal
-                    os.killpg(self._tstat_proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
                 except Exception:
-                    self._tstat_proc.kill()
-                try:
-                    self._tstat_proc.wait(timeout=1)
-                except Exception:
-                    pass
-            self._tstat_proc = None
+                    try:
+                        import os, signal
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                setattr(self, attr, None)
         if self._thread:
             self._thread.join(timeout=3)
         if not self._samples:
@@ -285,5 +309,27 @@ class PowerMonitor:
                 val = self._parse_tegrastats(line)
                 if val is not None:
                     self._samples.append(val)
+        except Exception:
+            pass
+
+    def _poll_powermetrics(self):
+        """Read SoC power from a live powermetrics subprocess.
+
+        Matches 'Combined Power (CPU + GPU + DRAM): XXXX mW' (Apple Silicon)
+        or 'Package Power: XXXX mW' (Intel Mac).
+        """
+        import re
+        _pat = re.compile(
+            r'(?:Combined Power \(CPU \+ GPU \+ DRAM\)|Package Power):\s*(\d+(?:\.\d+)?)\s*mW',
+            re.IGNORECASE,
+        )
+        try:
+            while not self._stop_evt.is_set():
+                line = self._pmx_proc.stdout.readline()
+                if not line:
+                    break
+                m = _pat.search(line)
+                if m:
+                    self._samples.append(float(m.group(1)))
         except Exception:
             pass
