@@ -25,8 +25,15 @@ import glob
 import threading
 
 
-# Labels tegrastats uses for total board power across JetPack versions
-_TSTAT_LABELS = ["VDD_IN", "POM_5V_IN", "VDD_CPU_GPU_CV"]
+# Labels tegrastats uses for total board power, in preference order.
+# Values may appear as "3924mW/3924mW" (Orin) or "3924/3924" (older).
+_TSTAT_LABELS = [
+    "VIN_SYS_5V0",      # Orin AGX — total system input power
+    "VDD_IN",           # Xavier / older Orin
+    "POM_5V_IN",        # Nano / TX2
+    "VDD_GPU_SOC",      # fallback: GPU+SOC only
+    "VDD_CPU_GPU_CV",   # fallback: CPU+GPU
+]
 
 
 class PowerMonitor:
@@ -97,10 +104,11 @@ class PowerMonitor:
                     return self._read_jetson, f"jetson-ina3221 ({len(readable)} ch)"
 
         # Jetson tegrastats — streaming subprocess (works when sysfs is absent)
+        # Requires sudo on most Jetson configurations.
         try:
             import subprocess, re
             proc = subprocess.Popen(
-                ["tegrastats", "--interval", "200"],
+                ["sudo", "tegrastats", "--interval", "200"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             )
             line = proc.stdout.readline()
@@ -198,7 +206,8 @@ class PowerMonitor:
     def _parse_tegrastats(line: str) -> float | None:
         import re
         for label in _TSTAT_LABELS:
-            m = re.search(rf'{label}\s+(\d+)/\d+', line)
+            # Matches both "3924/3924" (older) and "3924mW/3924mW" (Orin)
+            m = re.search(rf'{label}\s+(\d+)(?:mW)?/\d+', line)
             if m:
                 return float(m.group(1))  # already in mW
         return None
@@ -215,7 +224,7 @@ class PowerMonitor:
             import subprocess
             interval_ms = max(100, int(self._interval * 1000))
             self._tstat_proc = subprocess.Popen(
-                ["tegrastats", "--interval", str(interval_ms)],
+                ["sudo", "tegrastats", "--interval", str(interval_ms)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             )
             self._thread = threading.Thread(target=self._poll_tegrastats, daemon=True)
