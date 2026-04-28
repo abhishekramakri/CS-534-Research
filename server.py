@@ -18,11 +18,11 @@ from acoustics import compute_rir
 from net_utils import recv_msg, send_msg
 from profiler import Profiler
 from scene_classifier import classify_scene
-from segmentation import classify_materials
+from segmentation import classify_materials, run_mobilenet_timing
 from shoebox import estimate_shoebox_from_ply
 
 
-def handle_request(req: dict, device: str) -> dict:
+def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
     prof = Profiler()
     stage_start = req["stage_start"]
     stage_end = req["stage_end"]
@@ -53,16 +53,22 @@ def handle_request(req: dict, device: str) -> dict:
         # ----------------------------------------------------------------
         if stage_start <= 2 <= stage_end:
             img_ext = params.get("image_ext", ".png")
-            with prof.timer("2. Material segmentation"):
-                tmp = tempfile.NamedTemporaryFile(suffix=img_ext, delete=False)
-                tmp.write(req["image_bytes"])
-                tmp.close()
-                temp_files.append(tmp.name)
-                seg = classify_materials(
-                    tmp.name,
-                    method=params.get("seg_method", "segformer"),
-                    device=device,
-                )
+            tmp = tempfile.NamedTemporaryFile(suffix=img_ext, delete=False)
+            tmp.write(req["image_bytes"])
+            tmp.close()
+            temp_files.append(tmp.name)
+            use_samosa = samosa_mode or params.get("samosa_mode", False)
+            if use_samosa:
+                seg = classify_materials(tmp.name, method="heuristic", device=device)
+                inference_ms = run_mobilenet_timing(tmp.name, device)
+                prof._timings["2. Seg (MobileNetV3 timing, SAMOSA mode)"] = inference_ms
+            else:
+                with prof.timer("2. Material segmentation"):
+                    seg = classify_materials(
+                        tmp.name,
+                        method=params.get("seg_method", "segformer"),
+                        device=device,
+                    )
         else:
             seg = req.get("seg")
 
@@ -117,12 +123,13 @@ def handle_request(req: dict, device: str) -> dict:
     return resp
 
 
-def serve(host: str, port: int, device: str) -> None:
+def serve(host: str, port: int, device: str, samosa_mode: bool = False) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
-    print(f"[server] Listening on {host}:{port}  device={device}")
+    mode_label = "SAMOSA emulation (MobileNetV3)" if samosa_mode else "SegFormer"
+    print(f"[server] Listening on {host}:{port}  device={device}  seg={mode_label}")
     print("[server] Waiting for connections (Ctrl-C to stop)...")
 
     while True:
@@ -132,7 +139,7 @@ def serve(host: str, port: int, device: str) -> None:
             req = recv_msg(conn)
             stages = f"{req.get('stage_start')}–{req.get('stage_end')}"
             print(f"[server] Running stages {stages}")
-            resp = handle_request(req, device)
+            resp = handle_request(req, device, samosa_mode=samosa_mode)
             timings_str = "  ".join(
                 f"{k}: {v:.1f}ms" for k, v in resp.get("timings", {}).items()
             )
@@ -154,6 +161,8 @@ def main() -> None:
                         help="TCP port (default: 9000)")
     parser.add_argument("--device", default=None,
                         help="Torch device: cuda / cpu (default: auto-detect)")
+    parser.add_argument("--samosa-mode", action="store_true",
+                        help="Use MobileNetV3 timing (SAMOSA emulation) instead of SegFormer")
     args = parser.parse_args()
 
     device = args.device
@@ -164,7 +173,7 @@ def main() -> None:
         except ImportError:
             device = "cpu"
 
-    serve(args.host, args.port, device)
+    serve(args.host, args.port, device, samosa_mode=args.samosa_mode)
 
 
 if __name__ == "__main__":

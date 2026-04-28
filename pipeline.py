@@ -134,11 +134,12 @@ def run(
             "stage_start": offload_start,
             "stage_end":   offload_end,
             "params": {
-                "fs":         fs,
-                "max_order":  max_order,
-                "seg_method": seg_method,
-                "device":     device,
-                "image_ext":  os.path.splitext(image_path)[1] or ".png",
+                "fs":          fs,
+                "max_order":   max_order,
+                "seg_method":  seg_method,
+                "samosa_mode": samosa_mode,
+                "device":      device,
+                "image_ext":   os.path.splitext(image_path)[1] or ".png",
             },
         }
 
@@ -382,8 +383,9 @@ def main():
                          "(ScanNet scene dirs cannot be transferred over the network)")
         if args.server is None:
             parser.error("--offload requires --server HOST:PORT")
-        if args.samosa_mode:
-            parser.error("--samosa-mode is incompatible with --offload")
+        if args.samosa_mode and s > 2:
+            parser.error("--samosa-mode with --offload START > 2 would run segmentation "
+                         "locally, which requires a --seg-cache on the headset")
 
     # Auto-pick the first color frame from the scene dir if --image not given
     import glob as _glob
