@@ -75,11 +75,12 @@ def _get_segformer(device: str):
 def _run_segformer(img_array: np.ndarray, device: str, max_dim: int = 512):
     """
     Run SegFormer-b0 (ADE20K) on an HxWx3 uint8 array.
-    Returns seg_map [H,W] (at original resolution).
+    Returns seg_map [H,W] at inference resolution (capped to max_dim).
 
-    The image is downscaled to max_dim before inference (SegFormer-b0 was
-    trained at 512x512).  The segmentation map is upsampled back to the
-    original size.  This is significantly faster for high-res inputs.
+    Upsampling back to the original resolution is avoided: for computing
+    per-surface pixel proportions the relative counts are identical at any
+    resolution, and upsampling a 150-channel tensor to a large original size
+    can require tens of GB of memory for high-resolution inputs.
     """
     import torch
     import torch.nn.functional as F
@@ -91,22 +92,23 @@ def _run_segformer(img_array: np.ndarray, device: str, max_dim: int = 512):
     # Downscale to max_dim on the longest side (matches training resolution)
     scale = min(max_dim / H_orig, max_dim / W_orig, 1.0)
     if scale < 1.0:
-        H_new, W_new = int(H_orig * scale), int(W_orig * scale)
-        pil_img = Image.fromarray(img_array).resize((W_new, H_new), Image.BILINEAR)
+        H_inf, W_inf = int(H_orig * scale), int(W_orig * scale)
+        pil_img = Image.fromarray(img_array).resize((W_inf, H_inf), Image.BILINEAR)
     else:
+        H_inf, W_inf = H_orig, W_orig
         pil_img = Image.fromarray(img_array)
 
     inputs = processor(images=pil_img, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        logits = model(**inputs).logits                       # (1, 150, H/4, W/4)
+        logits = model(**inputs).logits                       # (1, 150, H_inf/4, W_inf/4)
 
-    # Upsample back to original resolution for pixel-accurate surface areas
+    # Upsample to inference size only — not original — to stay within memory bounds
     upsampled = F.interpolate(
-        logits, size=(H_orig, W_orig), mode="bilinear", align_corners=False
+        logits, size=(H_inf, W_inf), mode="bilinear", align_corners=False
     )
-    seg_map = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()   # (H, W)
+    seg_map = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()   # (H_inf, W_inf)
     return seg_map
 
 
