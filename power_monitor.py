@@ -5,11 +5,12 @@ Background-thread power sampler with auto-detecting backends.
 Backends tried in order:
   1. pynvml      — NVIDIA GPU via NVML (no subprocess, fast)
   2. nvidia-smi  — NVIDIA GPU via subprocess (fallback)
-  3. jetson      — Jetson Orin/Xavier/Nano INA3221 sysfs (board-level)
-  4. macos       — Apple Silicon/Intel Mac via ioreg AppleSmartBattery
+  3. jetson      — Jetson INA3221 sysfs (board-level, several path variants)
+  4. tegrastats  — Jetson tegrastats streaming process (fallback if no sysfs)
+  5. macos       — Apple Silicon/Intel Mac via ioreg AppleSmartBattery
                    NOTE: only produces readings when running on battery
                    (unplugged). Returns None samples when plugged in.
-  5. None        — unsupported platform
+  6. None        — unsupported platform
 
 Usage:
     mon = PowerMonitor()
@@ -24,11 +25,15 @@ import glob
 import threading
 
 
+# Labels tegrastats uses for total board power across JetPack versions
+_TSTAT_LABELS = ["VDD_IN", "POM_5V_IN", "VDD_CPU_GPU_CV"]
+
+
 class PowerMonitor:
     def __init__(self, interval_ms: int | None = None):
+        self._tstat_proc = None   # only used for tegrastats backend
         self._reader, self.backend = self._detect()
         if interval_ms is None:
-            # subprocess-based backends are slower to poll
             if self.backend in ("nvidia-smi (GPU)",) or self.backend.startswith("macos"):
                 interval_ms = 500
             else:
@@ -40,18 +45,18 @@ class PowerMonitor:
 
     @property
     def available(self) -> bool:
-        return self._reader is not None
+        return self._reader is not None or self.backend.startswith("tegrastats")
 
     # ------------------------------------------------------------------
     # Backend detection
     # ------------------------------------------------------------------
     def _detect(self):
-        # pynvml — fast NVIDIA path (comes with nvidia-ml-py3 or torch)
+        # pynvml — fast NVIDIA path
         try:
             import pynvml
             pynvml.nvmlInit()
             self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle)  # smoke test
+            pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle)
             return self._read_pynvml, "pynvml (GPU)"
         except Exception:
             pass
@@ -70,18 +75,16 @@ class PowerMonitor:
         except Exception:
             pass
 
-        # Jetson INA3221 sysfs (board-level power) — try several path variants
-        # across JetPack versions and kernel configurations
+        # Jetson INA3221 sysfs — several path variants across JetPack versions
         _JETSON_GLOBS = [
             "/sys/bus/i2c/drivers/ina3221/*/hwmon/hwmon*/power*_input",
             "/sys/bus/platform/drivers/ina3221/*/hwmon/hwmon*/power*_input",
             "/sys/bus/i2c/devices/*/hwmon/hwmon*/power*_input",
-            "/sys/class/hwmon/hwmon*/power*_input",  # broadest fallback
+            "/sys/class/hwmon/hwmon*/power*_input",
         ]
         for pattern in _JETSON_GLOBS:
             paths = sorted(glob.glob(pattern))
             if paths:
-                # Filter out zero-read paths (some hwmon entries always return 0)
                 readable = []
                 for p in paths:
                     try:
@@ -92,6 +95,21 @@ class PowerMonitor:
                 if readable:
                     self._jetson_paths = readable
                     return self._read_jetson, f"jetson-ina3221 ({len(readable)} ch)"
+
+        # Jetson tegrastats — streaming subprocess (works when sysfs is absent)
+        try:
+            import subprocess, re
+            proc = subprocess.Popen(
+                ["tegrastats", "--interval", "200"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            line = proc.stdout.readline()
+            proc.terminate()
+            proc.wait(timeout=2)
+            if line and self._parse_tegrastats(line) is not None:
+                return None, "tegrastats (Jetson board)"
+        except Exception:
+            pass
 
         # macOS — AppleSmartBattery via ioreg (no sudo, battery mode only)
         import sys
@@ -118,7 +136,7 @@ class PowerMonitor:
         return None, "unavailable"
 
     # ------------------------------------------------------------------
-    # Readers — each returns instantaneous power in mW, or None on error
+    # Readers
     # ------------------------------------------------------------------
     def _read_pynvml(self) -> float | None:
         try:
@@ -141,34 +159,6 @@ class PowerMonitor:
             pass
         return None
 
-    def _read_macos_battery(self) -> float | None:
-        import subprocess, re
-        try:
-            out = subprocess.run(
-                self._ioreg_cmd, capture_output=True, text=True, timeout=2,
-            ).stdout
-            # Try key names used across macOS versions / Apple Silicon
-            amps_m = (re.search(r'"InstantAmperage"\s*=\s*(\d+)', out)
-                      or re.search(r'"Amperage"\s*=\s*(-?\d+)', out)
-                      or re.search(r'"Current"\s*=\s*(-?\d+)', out))
-            volts_m = re.search(r'"Voltage"\s*=\s*(\d+)', out)
-            if not (amps_m and volts_m):
-                return None
-            # Apple Silicon stores signed mA as unsigned 64-bit (two's complement)
-            raw = int(amps_m.group(1))
-            amps_ma = raw - (1 << 64) if raw >= (1 << 63) else raw
-            volts_mv = int(volts_m.group(1))
-            # Negative = discharging (drawing from battery)
-            if amps_ma >= 0:
-                return None  # charging or idle on AC — reading not meaningful
-            power_mw = abs(amps_ma) * volts_mv / 1000.0  # mA × mV → mW
-            # Sanity check: MacBook Air M1 TDP is ~10–30W
-            if 500 < power_mw < 60_000:
-                return power_mw
-        except Exception:
-            pass
-        return None
-
     def _read_jetson(self) -> float | None:
         total_uw = 0
         valid = 0
@@ -180,25 +170,71 @@ class PowerMonitor:
                 pass
         return total_uw / 1000.0 if valid else None  # µW → mW
 
+    def _read_macos_battery(self) -> float | None:
+        import subprocess, re
+        try:
+            out = subprocess.run(
+                self._ioreg_cmd, capture_output=True, text=True, timeout=2,
+            ).stdout
+            amps_m = (re.search(r'"InstantAmperage"\s*=\s*(\d+)', out)
+                      or re.search(r'"Amperage"\s*=\s*(-?\d+)', out)
+                      or re.search(r'"Current"\s*=\s*(-?\d+)', out))
+            volts_m = re.search(r'"Voltage"\s*=\s*(\d+)', out)
+            if not (amps_m and volts_m):
+                return None
+            raw = int(amps_m.group(1))
+            amps_ma = raw - (1 << 64) if raw >= (1 << 63) else raw
+            volts_mv = int(volts_m.group(1))
+            if amps_ma >= 0:
+                return None  # charging or on AC
+            power_mw = abs(amps_ma) * volts_mv / 1000.0
+            if 500 < power_mw < 60_000:
+                return power_mw
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _parse_tegrastats(line: str) -> float | None:
+        import re
+        for label in _TSTAT_LABELS:
+            m = re.search(rf'{label}\s+(\d+)/\d+', line)
+            if m:
+                return float(m.group(1))  # already in mW
+        return None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def start(self):
-        if self._reader is None:
+        if not self.available:
             return
         self._samples.clear()
         self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._poll, daemon=True)
+        if self.backend.startswith("tegrastats"):
+            import subprocess
+            interval_ms = max(100, int(self._interval * 1000))
+            self._tstat_proc = subprocess.Popen(
+                ["tegrastats", "--interval", str(interval_ms)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            self._thread = threading.Thread(target=self._poll_tegrastats, daemon=True)
+        else:
+            self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
     def stop(self, duration_ms: float | None = None) -> dict | None:
-        """
-        Stop polling. Returns stats dict or None if no samples collected.
-        Pass duration_ms to get an energy estimate (avg_mW × duration).
-        """
+        """Stop polling. Returns stats dict or None if no samples collected."""
         self._stop_evt.set()
+        if self._tstat_proc is not None:
+            try:
+                self._tstat_proc.terminate()
+                self._tstat_proc.wait(timeout=2)
+            except Exception:
+                pass
+            self._tstat_proc = None
         if self._thread:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=3)
         if not self._samples:
             return None
         avg = sum(self._samples) / len(self._samples)
@@ -212,13 +248,26 @@ class PowerMonitor:
             stats["energy_mJ"] = round(avg * duration_ms / 1000.0, 1)
         return stats
 
+    # ------------------------------------------------------------------
+    # Poll loops
+    # ------------------------------------------------------------------
     def _poll(self):
-        # Read immediately on start, then wait between subsequent reads.
-        # The old pattern (wait first) meant the first sample was never
-        # collected for pipelines shorter than the poll interval.
         while True:
             val = self._reader()
             if val is not None:
                 self._samples.append(val)
             if self._stop_evt.wait(self._interval):
                 break
+
+    def _poll_tegrastats(self):
+        """Read power from a live tegrastats subprocess line by line."""
+        try:
+            while not self._stop_evt.is_set():
+                line = self._tstat_proc.stdout.readline()
+                if not line:
+                    break
+                val = self._parse_tegrastats(line)
+                if val is not None:
+                    self._samples.append(val)
+        except Exception:
+            pass
