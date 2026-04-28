@@ -1,0 +1,17 @@
+{
+  "walls": "plasterboard",
+  "floor": "wood_16mm",
+  "ceiling": "ceiling_fibre_absorber",
+  "distributions": {
+    "floor": {
+      "wood_16mm": 1.0
+    },
+    "walls": {
+      "plasterboard": 0.6113182884164392,
+      "curtains_densely_woven": 0.3886817115835608
+    },
+    "ceiling": {
+      "ceiling_fibre_absorber": 1.0
+    }
+  }
+}
