@@ -84,7 +84,7 @@ class PowerMonitor:
             try:
                 import subprocess
                 out = subprocess.run(
-                    ["ioreg", "-rn", "AppleSmartBattery", "-d", "1"],
+                    ["ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
                     capture_output=True, text=True, timeout=3,
                 ).stdout
                 if '"Voltage"' in out and '"InstantAmperage"' in out:
@@ -122,7 +122,7 @@ class PowerMonitor:
         import subprocess, re
         try:
             out = subprocess.run(
-                ["ioreg", "-rn", "AppleSmartBattery", "-d", "1"],
+                ["ioreg", "-r", "-c", "AppleSmartBatteryManager", "-d", "2"],
                 capture_output=True, text=True, timeout=2,
             ).stdout
             amps_m = re.search(r'"InstantAmperage"\s*=\s*(\d+)', out)
@@ -186,7 +186,12 @@ class PowerMonitor:
         return stats
 
     def _poll(self):
-        while not self._stop_evt.wait(self._interval):
+        # Read immediately on start, then wait between subsequent reads.
+        # The old pattern (wait first) meant the first sample was never
+        # collected for pipelines shorter than the poll interval.
+        while True:
             val = self._reader()
             if val is not None:
                 self._samples.append(val)
+            if self._stop_evt.wait(self._interval):
+                break
