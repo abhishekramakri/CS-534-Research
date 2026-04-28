@@ -14,29 +14,31 @@ import os
 import socket
 import tempfile
 
-from acoustics import compute_rir
-from net_utils import recv_msg, send_msg
-from profiler import Profiler
-from scene_classifier import classify_scene
 import io
 from PIL import Image as _PIL_Image
+from acoustics import compute_rir
+from net_utils import recv_msg, send_msg
+from power_monitor import PowerMonitor
+from profiler import Profiler
+from scene_classifier import classify_scene
 from segmentation import (
     classify_materials,
     run_mobilenet_timing,
     run_mobilenet_timing_from_pil,
     FALLBACK_MATERIALS,
 )
-from shoebox import estimate_shoebox_from_ply
 
 
 def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
     prof = Profiler()
+    power = PowerMonitor()
     stage_start = req["stage_start"]
     stage_end = req["stage_end"]
     params = req["params"]
     temp_files: list[str] = []
 
     geo = seg = scene_type = preset = rir = t60 = None
+    power.start()
 
     try:
         # ----------------------------------------------------------------
@@ -48,6 +50,7 @@ def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
                 tmp.write(req["ply_bytes"])
                 tmp.close()
                 temp_files.append(tmp.name)
+                from shoebox import estimate_shoebox_from_ply
                 geo = estimate_shoebox_from_ply(tmp.name)
             geo_out = {k: list(geo[k]) if hasattr(geo[k], "tolist") else geo[k]
                        for k in ("room_dims", "source_pos", "listener_pos")}
@@ -120,7 +123,8 @@ def handle_request(req: dict, device: str, samosa_mode: bool = False) -> dict:
             except OSError:
                 pass
 
-    resp: dict = {"error": None, "timings": prof.timings}
+    power_stats = power.stop(duration_ms=prof.total_ms)
+    resp: dict = {"error": None, "timings": prof.timings, "power": power_stats}
     if geo_out is not None:
         resp["geo"] = geo_out
     if seg is not None and stage_end >= 2:

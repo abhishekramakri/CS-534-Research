@@ -20,6 +20,7 @@ import os
 import socket as _socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from power_monitor import PowerMonitor
 from profiler import Profiler
 from shoebox import estimate_shoebox, estimate_shoebox_from_ply
 from segmentation import (
@@ -85,6 +86,7 @@ def run(
     offload_end: int | None = None,
 ):
     prof = Profiler()
+    power = PowerMonitor()
     offloading = bool(server_addr and offload_start is not None)
 
     print("=" * 52)
@@ -106,6 +108,7 @@ def run(
         # --------------------------------------------------------------
         print(f"\n[Offload] Stages {offload_start}–{offload_end} → {server_addr}")
         print(f"[Phase 1] Running local pre-offload stages...")
+        power.start()
 
         # Local stage 1 (shoebox) — only if we go before offload_start
         if offload_start > 1:
@@ -242,6 +245,7 @@ def run(
 
         mode_label = "SAMOSA emulation" if samosa_mode else seg_method
         print(f"\n[Phase 1] Running perception modules in parallel (seg={mode_label})...")
+        power.start()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(_run_shoebox), pool.submit(_run_segmentation)]
@@ -298,6 +302,8 @@ def run(
     with prof.timer("5. Audio rendering"):
         apply_rir(input_audio, rir, output_audio)
 
+    client_power = power.stop(duration_ms=prof.total_ms)
+
     # ------------------------------------------------------------------
     # Latency report
     # ------------------------------------------------------------------
@@ -314,6 +320,27 @@ def run(
         print(f"    {'Server total':<40s} {server_total:7.1f} ms")
         print(f"    {'Network overhead':<40s} {network_overhead:7.1f} ms")
         print(f"    (round-trip wall-clock:               {rtt_ms:7.1f} ms)")
+        print()
+
+    # ------------------------------------------------------------------
+    # Power report
+    # ------------------------------------------------------------------
+    server_power = resp.get("power") if offloading else None
+    if client_power or server_power:
+        print("=" * 52)
+        print("  Power Usage")
+        print("=" * 52)
+        if client_power:
+            e = f"  {client_power['energy_mJ']:.1f} mJ" if "energy_mJ" in client_power else ""
+            print(f"  Client  [{client_power['backend']}]")
+            print(f"    Avg {client_power['avg_mW']:,.0f} mW  "
+                  f"Peak {client_power['peak_mW']:,.0f} mW{e}")
+        if server_power:
+            e = f"  {server_power['energy_mJ']:.1f} mJ" if "energy_mJ" in server_power else ""
+            print(f"  Server  [{server_power['backend']}]")
+            print(f"    Avg {server_power['avg_mW']:,.0f} mW  "
+                  f"Peak {server_power['peak_mW']:,.0f} mW{e}")
+        print("=" * 52)
         print()
 
     return {
